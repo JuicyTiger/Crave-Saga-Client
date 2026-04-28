@@ -1688,6 +1688,17 @@ function attachShortcutHandlers() {
         if (keyLower === 'meta' || keyLower === 'command') modifierState.meta = true;
         if (input.isAutoRepeat || input.isComposing) return;
 
+        // [Muramasa Forge] F12 打开 DevTools（开发调试用，不受 isPlayableSessionUrl 限制）
+        if (keyLower === 'f12') {
+            if (mainWindow.webContents.isDevToolsOpened()) {
+                mainWindow.webContents.closeDevTools();
+            } else {
+                mainWindow.webContents.openDevTools({ mode: 'detach' });
+            }
+            event.preventDefault();
+            return;
+        }
+
         const currentUrl = mainWindow.webContents.getURL();
         if (!isPlayableSessionUrl(currentUrl)) return;
 
