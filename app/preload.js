@@ -1521,6 +1521,95 @@ window.addEventListener('DOMContentLoaded', () => {
                     tryCanvasAt(0);
                 }
 
+                function installSubframeCustomScriptsLoader() {
+                    if (window.__cscSubframeCustomLoaderStarted) return;
+                    window.__cscSubframeCustomLoaderStarted = true;
+
+                    if (!window.electronAPI || typeof window.electronAPI.getCustomScripts !== 'function') return;
+
+                    function ensureSubframeCustomEngineBridge() {
+                        if (!window.__cscBridge || typeof window.__cscBridge !== 'object') {
+                            window.__cscBridge = {};
+                        }
+                        if (!window.__cscBridge.engine || typeof window.__cscBridge.engine !== 'object') {
+                            window.__cscBridge.engine = {};
+                        }
+
+                        var engine = window.__cscBridge.engine;
+                        engine.document = document;
+                        engine.gameCanvas = getTrackedSubframeGameCanvas();
+                        if (typeof window.masterData !== 'undefined') {
+                            engine.masterData = window.masterData;
+                        }
+                        return engine;
+                    }
+
+                    function waitForSubframeEngineAndRun() {
+                        var gameCanvas = getTrackedSubframeGameCanvas();
+                        if (typeof __require !== 'function' || typeof window.cc !== 'object' || !gameCanvas) {
+                            requestAnimationFrame(waitForSubframeEngineAndRun);
+                            return;
+                        }
+
+                        try {
+                            __require('Singleton');
+                        } catch (error) {
+                            requestAnimationFrame(waitForSubframeEngineAndRun);
+                            return;
+                        }
+
+                        var customEngine = ensureSubframeCustomEngineBridge();
+                        customEngine.require = __require;
+                        customEngine.cc = window.cc;
+                        customEngine.gameCanvas = gameCanvas;
+
+                        window.electronAPI.getCustomScripts().then(function(scripts) {
+                            if (!Array.isArray(scripts) || scripts.length === 0) return;
+
+                            var sendNotification = typeof window.sendGameNotification === 'function'
+                                ? window.sendGameNotification
+                                : function(title, message) {
+                                    if (!window.electronAPI || typeof window.electronAPI.sendNotification !== 'function') return;
+                                    window.electronAPI.sendNotification(title, message);
+                                };
+
+                            var customContext = {
+                                window: window,
+                                document: document,
+                                gameCanvas: gameCanvas,
+                                masterData: typeof window.masterData !== 'undefined' ? window.masterData : null,
+                                engine: customEngine,
+                                cscBridge: window.__cscBridge,
+                                sendNotification: sendNotification,
+                                runCommand: function(command, payload) {
+                                    if (!window.electronAPI || typeof window.electronAPI.runCommand !== 'function') {
+                                        return Promise.resolve({ ok: false, error: 'API_UNAVAILABLE' });
+                                    }
+                                    return window.electronAPI.runCommand(command, payload);
+                                }
+                            };
+
+                            for (var i = 0; i < scripts.length; i++) {
+                                var script = scripts[i];
+                                if (!script || typeof script.code !== 'string') continue;
+                                var sourceName = script.source || script.id || ('subframe-custom-' + (i + 1) + '.js');
+                                try {
+                                    var wrappedSource = script.code + '\\n//# sourceURL=' + encodeURI(sourceName);
+                                    var evaluator = new Function('context', wrappedSource);
+                                    evaluator(customContext);
+                                    console.log('[CSC][Subframe][Custom] Loaded', sourceName);
+                                } catch (error) {
+                                    console.error('[CSC][Subframe][Custom] Failed to load', sourceName, error);
+                                }
+                            }
+                        }).catch(function(error) {
+                            console.error('[CSC][Subframe][Custom] Loader error:', error);
+                        });
+                    }
+
+                    waitForSubframeEngineAndRun();
+                }
+
                 function installSubframeMainEventBridge() {
                     if (window.__cscSubframeMainEventBridgeInstalled) return;
                     if (!window.electronAPI || typeof window.electronAPI.onMainEvent !== 'function') return;
@@ -1602,11 +1691,12 @@ window.addEventListener('DOMContentLoaded', () => {
                     sanitizeGame();
                     installSubframeRightClickLongPress();
                     installSubframeCacheLoader();
+                    installSubframeCustomScriptsLoader();
                 }
             })();
         `;
             document.documentElement.appendChild(subframeScript);
-        } catch (error) {}
+        } catch (error) { }
         return;
     }
 
