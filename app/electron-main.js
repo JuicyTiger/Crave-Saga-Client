@@ -9,6 +9,7 @@ const cache = require('./cache'); // Import the caching proxy
 const ini = require('./ini');
 const { decode: decodeMsgpack } = require('@msgpack/msgpack');
 const { createSettingsStore, DEFAULT_SETTINGS } = require('./settings-store');
+const automationConfigStore = require('./automation-config-store');
 const { minCraveAutoVersion } = require('../package.json');
 
 let mainWindow;
@@ -265,9 +266,21 @@ function buildRecoveryStartPayload(recoverySessionId = null) {
         ? cfg.activeServerHost
         : automationControlState.activeServerHost;
 
+    // 从持久化 store 补全可能缺失的模式专用筛选配置（如 favoriteQuestFilter 等）
+    let persistedConfig = {};
+    try {
+        persistedConfig = automationConfigStore.getAll() || {};
+    } catch (_e) { /* 读取失败时使用空对象 */ }
+
+    const mergedConfig = {
+        raidFilter: cfg.raidFilter,
+        ...persistedConfig
+    };
+
     return {
         action: 'CRAVE_SAGA_START',
         mode,
+        config: mergedConfig,
         raidFilter: cfg.raidFilter,
         serverRegion,
         serverHost: serverHost || null,
@@ -1417,8 +1430,12 @@ function getSidecarPanelBounds() {
     if (!hasMainWindow()) return null;
     const mainBounds = mainWindow.getBounds();
     const panelWidth = SIDECAR_PANEL_WIDTH;
+    // Windows DWM 给有框架窗口添加了约 7px 的透明扩展边框（阴影区域），
+    // getBounds() 包含了这部分不可见区域，导致面板与游戏窗口之间出现可见缝隙。
+    // 减去该偏移量让两个窗口视觉上紧贴。
+    const dwmFrameGap = process.platform === 'win32' ? 7 : 0;
     return {
-        x: mainBounds.x + mainBounds.width,
+        x: mainBounds.x + mainBounds.width - dwmFrameGap,
         y: mainBounds.y,
         width: panelWidth,
         height: mainBounds.height
@@ -1462,7 +1479,7 @@ function createSidecarPanelWindow() {
         show: false,
         icon: path.join(__dirname, 'icon.png'),
         webPreferences: {
-            preload: path.join(__dirname, 'panel-preload.js'),
+            preload: path.join(__dirname, 'automation-panel-preload.js'),
             contextIsolation: true,
             nodeIntegration: false,
             sandbox: true
@@ -3415,6 +3432,29 @@ async function runCommandDispatcher(command, payload) {
                     ok: true,
                     command,
                     state: buildAutomationStateSnapshot()
+                };
+            }
+            case 'GET_AUTOMATION_CONFIG': {
+                return {
+                    ok: true,
+                    command,
+                    config: automationConfigStore.getAll()
+                };
+            }
+            case 'SET_AUTOMATION_CONFIG': {
+                if (!payload || typeof payload !== 'object') {
+                    return {
+                        ok: false,
+                        error: 'INVALID_PAYLOAD',
+                        command,
+                        message: 'SET_AUTOMATION_CONFIG requires object payload.'
+                    };
+                }
+                const written = automationConfigStore.merge(payload);
+                return {
+                    ok: written,
+                    command,
+                    config: written ? automationConfigStore.getAll() : null
                 };
             }
             default:
