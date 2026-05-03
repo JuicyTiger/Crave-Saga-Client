@@ -19,6 +19,11 @@ let tray = null;
 let isQuitting = false;
 let contextMenuPopupHandler = null;
 let persistedWindowBounds = null;
+let sidecarPanelWindow = null;
+let sidecarPanelVisible = false;
+const SIDECAR_PANEL_WIDTH = 360;
+const SIDECAR_PANEL_MIN_WIDTH = 320;
+const SIDECAR_PANEL_MAX_WIDTH = 480;
 function getTrayIconAssetPath() {
     if (process.platform === 'darwin') {
         return path.join(__dirname, 'icon_mac.png');
@@ -119,6 +124,152 @@ const gameCommandState = {
     muteBgm: false,
     muteSe: false
 };
+
+const AUTOMATION_MODES = new Set(['descentRaid', 'regularRaid', 'favoriteQuest', 'forging', 'tower_subjection']);
+
+const automationControlState = {
+    connected: false,
+    running: false,
+    explicitlyStopped: false,
+    activeRecoverySessionId: null,
+    currentMode: null,
+    lastSelectedMode: null,
+    lastStartConfig: {
+        raidFilter: undefined,
+        activeServerRegion: 'jp',
+        activeServerHost: null
+    },
+    moduleStates: {
+        descentRaid: { active: false, currentScreen: null, completionCount: 0, lastUpdateAt: 0 },
+        regularRaid: { active: false, currentScreen: null, completionCount: 0, lastUpdateAt: 0 },
+        favoriteQuest: { active: false, currentScreen: null, completionCount: 0, lastUpdateAt: 0 },
+        forging: { active: false, currentScreen: null, completionCount: 0, lastUpdateAt: 0 },
+        tower_subjection: { active: false, currentScreen: null, completionCount: 0, lastUpdateAt: 0 }
+    },
+    activeServerRegion: 'jp',
+    activeServerHost: null,
+    lastCommandAt: 0
+};
+
+function resetAutomationModuleStates() {
+    for (const mode of Object.keys(automationControlState.moduleStates)) {
+        automationControlState.moduleStates[mode].active = false;
+        automationControlState.moduleStates[mode].currentScreen = null;
+        automationControlState.moduleStates[mode].completionCount = 0;
+        automationControlState.moduleStates[mode].lastUpdateAt = 0;
+    }
+}
+
+function buildAutomationStateSnapshot() {
+    return {
+        connected: !!automationControlState.connected,
+        running: !!automationControlState.running,
+        explicitlyStopped: !!automationControlState.explicitlyStopped,
+        activeRecoverySessionId: automationControlState.activeRecoverySessionId,
+        currentMode: automationControlState.currentMode,
+        lastSelectedMode: automationControlState.lastSelectedMode,
+        moduleStates: {
+            descentRaid: {
+                active: !!automationControlState.moduleStates.descentRaid.active,
+                currentScreen: automationControlState.moduleStates.descentRaid.currentScreen,
+                completionCount: Number(automationControlState.moduleStates.descentRaid.completionCount) || 0,
+                lastUpdateAt: Number(automationControlState.moduleStates.descentRaid.lastUpdateAt) || 0
+            },
+            regularRaid: {
+                active: !!automationControlState.moduleStates.regularRaid.active,
+                currentScreen: automationControlState.moduleStates.regularRaid.currentScreen,
+                completionCount: Number(automationControlState.moduleStates.regularRaid.completionCount) || 0,
+                lastUpdateAt: Number(automationControlState.moduleStates.regularRaid.lastUpdateAt) || 0
+            },
+            favoriteQuest: {
+                active: !!automationControlState.moduleStates.favoriteQuest.active,
+                currentScreen: automationControlState.moduleStates.favoriteQuest.currentScreen,
+                completionCount: Number(automationControlState.moduleStates.favoriteQuest.completionCount) || 0,
+                lastUpdateAt: Number(automationControlState.moduleStates.favoriteQuest.lastUpdateAt) || 0
+            },
+            forging: {
+                active: !!automationControlState.moduleStates.forging.active,
+                currentScreen: automationControlState.moduleStates.forging.currentScreen,
+                completionCount: Number(automationControlState.moduleStates.forging.completionCount) || 0,
+                lastUpdateAt: Number(automationControlState.moduleStates.forging.lastUpdateAt) || 0
+            },
+            tower_subjection: {
+                active: !!automationControlState.moduleStates.tower_subjection.active,
+                currentScreen: automationControlState.moduleStates.tower_subjection.currentScreen,
+                completionCount: Number(automationControlState.moduleStates.tower_subjection.completionCount) || 0,
+                lastUpdateAt: Number(automationControlState.moduleStates.tower_subjection.lastUpdateAt) || 0
+            }
+        },
+        activeServerRegion: automationControlState.activeServerRegion,
+        activeServerHost: automationControlState.activeServerHost,
+        lastCommandAt: automationControlState.lastCommandAt
+    };
+}
+
+function resolveStartPayload(payload) {
+    if (!payload || typeof payload !== 'object') return null;
+    const mode = payload.mode;
+    if (!AUTOMATION_MODES.has(mode)) return null;
+
+    const config = payload.config && typeof payload.config === 'object' ? payload.config : {};
+    const activeServerRegion = typeof config.activeServerRegion === 'string'
+        ? config.activeServerRegion
+        : automationControlState.activeServerRegion;
+    const activeServerHost = Object.prototype.hasOwnProperty.call(config, 'activeServerHost')
+        ? config.activeServerHost
+        : automationControlState.activeServerHost;
+
+    const recoverySessionId = typeof payload.recoverySessionId === 'string' && payload.recoverySessionId.trim()
+        ? payload.recoverySessionId.trim()
+        : null;
+
+    return {
+        mode,
+        commandPayload: {
+            action: 'CRAVE_SAGA_START',
+            mode,
+            config,
+            raidFilter: config.raidFilter,
+            serverRegion: activeServerRegion || 'jp',
+            serverHost: activeServerHost || null,
+            recoverySessionId
+        },
+        activeServerRegion: activeServerRegion || 'jp',
+        activeServerHost: activeServerHost || null,
+        recoverySessionId
+    };
+}
+
+function createRecoverySessionId() {
+    if (crypto && typeof crypto.randomUUID === 'function') {
+        return crypto.randomUUID();
+    }
+    return `recovery-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function buildRecoveryStartPayload(recoverySessionId = null) {
+    const mode = automationControlState.lastSelectedMode;
+    if (!AUTOMATION_MODES.has(mode)) return null;
+
+    const cfg = automationControlState.lastStartConfig || {};
+    const serverRegion = typeof cfg.activeServerRegion === 'string' && cfg.activeServerRegion
+        ? cfg.activeServerRegion
+        : (automationControlState.activeServerRegion || 'jp');
+    const serverHost = Object.prototype.hasOwnProperty.call(cfg, 'activeServerHost')
+        ? cfg.activeServerHost
+        : automationControlState.activeServerHost;
+
+    return {
+        action: 'CRAVE_SAGA_START',
+        mode,
+        raidFilter: cfg.raidFilter,
+        serverRegion,
+        serverHost: serverHost || null,
+        recoverySessionId: typeof recoverySessionId === 'string' && recoverySessionId.trim()
+            ? recoverySessionId.trim()
+            : null
+    };
+}
 
 const modifierState = {
     control: false,
@@ -1252,6 +1403,126 @@ function isMainWindowVisible() {
     return hasMainWindow() && mainWindow.isVisible() && !mainWindow.isMinimized();
 }
 
+function hasSidecarPanelWindow() {
+    return !!sidecarPanelWindow && !sidecarPanelWindow.isDestroyed();
+}
+
+function getSidecarPanelBounds() {
+    if (!hasMainWindow()) return null;
+    const mainBounds = mainWindow.getBounds();
+    const panelWidth = SIDECAR_PANEL_WIDTH;
+    return {
+        x: mainBounds.x + mainBounds.width,
+        y: mainBounds.y,
+        width: panelWidth,
+        height: mainBounds.height
+    };
+}
+
+function syncSidecarPanelBounds() {
+    if (!hasMainWindow() || !hasSidecarPanelWindow()) return;
+    const nextBounds = getSidecarPanelBounds();
+    if (!nextBounds) return;
+    sidecarPanelWindow.setBounds(nextBounds, false);
+}
+
+function createSidecarPanelWindow() {
+    if (!hasMainWindow()) return null;
+    if (hasSidecarPanelWindow()) return sidecarPanelWindow;
+
+    const panelHtmlPath = path.join(CUSTOM_DIR_PATH, 'panel', 'panel.html');
+    if (!fs.existsSync(panelHtmlPath)) {
+        console.warn(`[Panel] panel.html not found: ${panelHtmlPath}`);
+        return null;
+    }
+
+    const bounds = getSidecarPanelBounds();
+    if (!bounds) return null;
+
+    sidecarPanelWindow = new BrowserWindow({
+        parent: mainWindow,
+        x: bounds.x,
+        y: bounds.y,
+        width: bounds.width,
+        height: bounds.height,
+        minWidth: SIDECAR_PANEL_MIN_WIDTH,
+        maxWidth: SIDECAR_PANEL_MAX_WIDTH,
+        minHeight: 460,
+        resizable: true,
+        maximizable: false,
+        minimizable: false,
+        frame: false,
+        autoHideMenuBar: true,
+        show: false,
+        icon: path.join(__dirname, 'icon.png'),
+        webPreferences: {
+            preload: path.join(__dirname, 'panel-preload.js'),
+            contextIsolation: true,
+            nodeIntegration: false,
+            sandbox: true
+        }
+    });
+
+    if (process.platform === 'win32') {
+        sidecarPanelWindow.setMenuBarVisibility(false);
+        sidecarPanelWindow.removeMenu();
+    }
+
+    sidecarPanelWindow.loadFile(panelHtmlPath);
+
+    sidecarPanelWindow.on('close', event => {
+        if (!isQuitting) {
+            event.preventDefault();
+            sidecarPanelVisible = false;
+            sidecarPanelWindow.hide();
+            updateTrayDisplay();
+        }
+    });
+
+    sidecarPanelWindow.on('closed', () => {
+        sidecarPanelWindow = null;
+        sidecarPanelVisible = false;
+        updateTrayDisplay();
+    });
+
+    sidecarPanelWindow.on('resize', () => {
+        syncSidecarPanelBounds();
+    });
+
+    return sidecarPanelWindow;
+}
+
+function showSidecarPanel() {
+    if (!hasMainWindow()) return false;
+    const panel = createSidecarPanelWindow();
+    if (!panel) return false;
+    syncSidecarPanelBounds();
+    sidecarPanelVisible = true;
+    panel.show();
+    panel.focus();
+    updateTrayDisplay();
+    return true;
+}
+
+function hideSidecarPanel() {
+    if (!hasSidecarPanelWindow()) {
+        sidecarPanelVisible = false;
+        updateTrayDisplay();
+        return true;
+    }
+    sidecarPanelVisible = false;
+    sidecarPanelWindow.hide();
+    updateTrayDisplay();
+    return true;
+}
+
+function toggleSidecarPanel() {
+    if (sidecarPanelVisible && hasSidecarPanelWindow() && sidecarPanelWindow.isVisible()) {
+        return hideSidecarPanel();
+    }
+    return showSidecarPanel();
+}
+
 function showMainWindow() {
     if (!hasMainWindow()) return;
     if (mainWindow.isMinimized()) mainWindow.restore();
@@ -1392,6 +1663,12 @@ function buildTrayMenu() {
         },
         { type: 'separator' },
         {
+            label: sidecarPanelVisible ? 'Hide automation panel' : 'Show automation panel',
+            accelerator: 'P',
+            click: () => toggleSidecarPanel()
+        },
+        { type: 'separator' },
+        {
             label: 'Quit',
             click: () => quitApplication()
         }
@@ -1508,14 +1785,14 @@ function buildContextMenu() {
     const languageMenuItem =
         languages.length > 1
             ? {
-                  label: 'Language',
-                  submenu: languages.map(language => ({
-                      label: language.name,
-                      type: 'radio',
-                      checked: currentLanguage ? currentLanguage.id === language.id : false,
-                      click: () => void runCommandDispatcher('changeLanguage', { lang: language.id })
-                  }))
-              }
+                label: 'Language',
+                submenu: languages.map(language => ({
+                    label: language.name,
+                    type: 'radio',
+                    checked: currentLanguage ? currentLanguage.id === language.id : false,
+                    click: () => void runCommandDispatcher('changeLanguage', { lang: language.id })
+                }))
+            }
             : null;
 
     return Menu.buildFromTemplate([
@@ -1556,6 +1833,11 @@ function buildContextMenu() {
             label: 'Screenshot to clipboard',
             accelerator: 'F12',
             click: () => void runCommandDispatcher('screenshotToClipboard')
+        },
+        {
+            label: sidecarPanelVisible ? 'Hide automation panel' : 'Show automation panel',
+            accelerator: 'P',
+            click: () => toggleSidecarPanel()
         },
         { type: 'separator' },
         {
@@ -1740,6 +2022,16 @@ function attachShortcutHandlers() {
                 if (!isEditable) {
                     event.preventDefault();
                     void runCommandDispatcher('screenshotToClipboard');
+                }
+            });
+            return;
+        }
+
+        if ((keyLower === 'p' || code === 'KeyP') && !hasModifier) {
+            void isEditableElementFocused().then(isEditable => {
+                if (!isEditable) {
+                    event.preventDefault();
+                    toggleSidecarPanel();
                 }
             });
             return;
@@ -1942,6 +2234,28 @@ function createWindow(options = {}) {
     mainWindow.on('hide', updateTrayDisplay);
     mainWindow.on('minimize', updateTrayDisplay);
     mainWindow.on('restore', updateTrayDisplay);
+    mainWindow.on('show', () => {
+        if (sidecarPanelVisible) {
+            showSidecarPanel();
+            syncSidecarPanelBounds();
+        }
+    });
+    mainWindow.on('hide', () => {
+        if (hasSidecarPanelWindow()) {
+            sidecarPanelWindow.hide();
+        }
+    });
+    mainWindow.on('minimize', () => {
+        if (hasSidecarPanelWindow()) {
+            sidecarPanelWindow.hide();
+        }
+    });
+    mainWindow.on('restore', () => {
+        if (sidecarPanelVisible) {
+            showSidecarPanel();
+            syncSidecarPanelBounds();
+        }
+    });
     let persistBoundsDebounceTimer = null;
     const persistOwnedWindowBounds = () => {
         if (mainWindow !== ownedWindow) return;
@@ -1965,10 +2279,31 @@ function createWindow(options = {}) {
     mainWindow.on('resize', schedulePersistOwnedWindowBounds);
     mainWindow.on('move', schedulePersistOwnedWindowBounds);
     mainWindow.on('close', flushPersistOwnedWindowBounds);
+    mainWindow.on('resize', syncSidecarPanelBounds);
+    mainWindow.on('move', syncSidecarPanelBounds);
+    mainWindow.on('enter-full-screen', () => {
+        if (hasSidecarPanelWindow()) {
+            sidecarPanelWindow.hide();
+        }
+    });
+    mainWindow.on('leave-full-screen', () => {
+        if (sidecarPanelVisible) {
+            showSidecarPanel();
+            syncSidecarPanelBounds();
+        }
+    });
 
     mainWindow.on('close', () => {
         if (webSecuritySwitchInProgress && ownedWindow !== mainWindow) return;
         isQuitting = true;
+        if (hasSidecarPanelWindow()) {
+            try {
+                sidecarPanelWindow.destroy();
+            } catch (_) {
+                // no-op
+            }
+            sidecarPanelWindow = null;
+        }
     });
 
     // Emitted when the window is closed.
@@ -2363,9 +2698,9 @@ function stopAutomationServer() {
     const serverRef = automationServer;
     automationServer = null;
     automationToken = null;
-    try { fs.unlinkSync(AUTOMATION_TOKEN_PATH); } catch (_) {}
+    try { fs.unlinkSync(AUTOMATION_TOKEN_PATH); } catch (_) { }
     for (const socket of automationSockets) {
-        try { socket.destroy(); } catch (_) {}
+        try { socket.destroy(); } catch (_) { }
     }
     automationSockets.clear();
     try {
@@ -2420,7 +2755,7 @@ function startAutomationServer() {
                 replied = true;
                 try {
                     socket.write('Error: 請求內容過大\n');
-                } catch (_) {}
+                } catch (_) { }
                 socket.destroy();
                 return;
             }
@@ -2430,7 +2765,7 @@ function startAutomationServer() {
                 const receivedToken = newlineIndex === -1 ? requestBuffer : requestBuffer.slice(0, newlineIndex);
                 if (receivedToken !== automationToken) {
                     replied = true;
-                    try { socket.write('Error: 驗證失敗，token 不符\n'); } catch (_) {}
+                    try { socket.write('Error: 驗證失敗，token 不符\n'); } catch (_) { }
                     socket.destroy();
                     return;
                 }
@@ -2439,14 +2774,14 @@ function startAutomationServer() {
                 // 版本交換：解析 CraveAuto 版本行（若存在）
                 if (!requestBuffer.startsWith('CRAVEAUTO_VERSION:')) {
                     replied = true;
-                    try { socket.write('Error: 未發送版本資訊，請更新 CraveAuto\n'); } catch (_) {}
+                    try { socket.write('Error: 未發送版本資訊，請更新 CraveAuto\n'); } catch (_) { }
                     socket.destroy();
                     return;
                 }
                 const versionNewline = requestBuffer.indexOf('\n');
                 if (versionNewline === -1) {
                     replied = true;
-                    try { socket.write('Error: 版本資訊不完整（請回報此問題）\n'); } catch (_) {}
+                    try { socket.write('Error: 版本資訊不完整（請回報此問題）\n'); } catch (_) { }
                     socket.destroy();
                     return;
                 }
@@ -2455,11 +2790,11 @@ function startAutomationServer() {
                 const minVer = minCraveAutoVersion.split('.').map(Number);
                 if (compareVersionArrays(craveAutoVer, minVer) < 0) {
                     replied = true;
-                    try { socket.write(`Error: CraveAuto 版本過舊，請更新至 ${minCraveAutoVersion} 以上\n`); } catch (_) {}
+                    try { socket.write(`Error: CraveAuto 版本過舊，請更新至 ${minCraveAutoVersion} 以上\n`); } catch (_) { }
                     socket.destroy();
                     return;
                 }
-                try { socket.write(`VERSION:${app.getVersion()}\n`); } catch (_) {}
+                try { socket.write(`VERSION:${app.getVersion()}\n`); } catch (_) { }
                 requestBuffer = requestBuffer.slice(versionNewline + 1);
 
                 void writeResponse();
@@ -2861,6 +3196,220 @@ async function runCommandDispatcher(command, payload) {
                 const eventPayload = payload?.payload ?? payload ?? null;
                 const sent = emitMainEvent(type, eventPayload);
                 return { ok: sent, command, type };
+            }
+            case 'START_AUTOMATION': {
+                const normalized = resolveStartPayload(payload);
+                if (!normalized) {
+                    return {
+                        ok: false,
+                        error: 'INVALID_AUTOMATION_START_PAYLOAD',
+                        command,
+                        message: 'START_AUTOMATION requires payload.mode in allowed modes.'
+                    };
+                }
+
+                const recoverySessionId = normalized.recoverySessionId || createRecoverySessionId();
+                normalized.commandPayload.recoverySessionId = recoverySessionId;
+                const sent = emitRendererCommand('CRAVE_SAGA_START', normalized.commandPayload);
+                if (!sent) {
+                    return {
+                        ok: false,
+                        error: 'RENDERER_UNAVAILABLE',
+                        command
+                    };
+                }
+
+                resetAutomationModuleStates();
+                automationControlState.running = true;
+                automationControlState.explicitlyStopped = false;
+                automationControlState.activeRecoverySessionId = recoverySessionId;
+                automationControlState.currentMode = normalized.mode;
+                automationControlState.lastSelectedMode = normalized.mode;
+                automationControlState.lastStartConfig = {
+                    raidFilter: normalized.commandPayload.raidFilter,
+                    activeServerRegion: normalized.activeServerRegion,
+                    activeServerHost: normalized.activeServerHost
+                };
+                automationControlState.moduleStates[normalized.mode].active = true;
+                automationControlState.activeServerRegion = normalized.activeServerRegion;
+                automationControlState.activeServerHost = normalized.activeServerHost;
+                automationControlState.lastCommandAt = Date.now();
+
+                return {
+                    ok: true,
+                    command,
+                    state: buildAutomationStateSnapshot()
+                };
+            }
+            case 'SHOW_PANEL': {
+                const shown = showSidecarPanel();
+                return { ok: shown, command, visible: sidecarPanelVisible };
+            }
+            case 'HIDE_PANEL': {
+                const hidden = hideSidecarPanel();
+                return { ok: hidden, command, visible: sidecarPanelVisible };
+            }
+            case 'TOGGLE_PANEL': {
+                const toggled = toggleSidecarPanel();
+                return { ok: toggled, command, visible: sidecarPanelVisible };
+            }
+            case 'STOP_AUTOMATION': {
+                const sent = emitRendererCommand('CRAVE_SAGA_STOP', { action: 'CRAVE_SAGA_STOP' });
+                if (!sent) {
+                    return {
+                        ok: false,
+                        error: 'RENDERER_UNAVAILABLE',
+                        command
+                    };
+                }
+
+                resetAutomationModuleStates();
+                automationControlState.running = false;
+                automationControlState.explicitlyStopped = true;
+                automationControlState.activeRecoverySessionId = null;
+                automationControlState.currentMode = null;
+                automationControlState.lastCommandAt = Date.now();
+
+                return {
+                    ok: true,
+                    command,
+                    state: buildAutomationStateSnapshot()
+                };
+            }
+            case 'AUTOMATION_ENGINE_DETECTED': {
+                const connected = payload && typeof payload === 'object' && typeof payload.connected === 'boolean'
+                    ? payload.connected
+                    : true;
+                automationControlState.connected = connected;
+                automationControlState.lastCommandAt = Date.now();
+
+                if (connected && !automationControlState.running) {
+                    if (automationControlState.explicitlyStopped) {
+                    } else {
+                        const recoverySessionId = createRecoverySessionId();
+                        const recoveryPayload = buildRecoveryStartPayload(recoverySessionId);
+                        if (recoveryPayload) {
+                            const recovered = emitRendererCommand('CRAVE_SAGA_START', recoveryPayload);
+                            if (recovered) {
+                                resetAutomationModuleStates();
+                                automationControlState.running = true;
+                                automationControlState.activeRecoverySessionId = recoverySessionId;
+                                automationControlState.currentMode = recoveryPayload.mode;
+                                automationControlState.moduleStates[recoveryPayload.mode].active = true;
+                                automationControlState.activeServerRegion = recoveryPayload.serverRegion || 'jp';
+                                automationControlState.activeServerHost = recoveryPayload.serverHost || null;
+                                automationControlState.lastCommandAt = Date.now();
+                            }
+                        }
+                    }
+                }
+
+                return {
+                    ok: true,
+                    command,
+                    state: buildAutomationStateSnapshot()
+                };
+            }
+            case 'AUTOMATION_STOPPED': {
+                const stopReason = typeof payload?.reason === 'string' ? payload.reason : null;
+                const recoverySessionId = typeof payload?.recoverySessionId === 'string' && payload.recoverySessionId.trim()
+                    ? payload.recoverySessionId.trim()
+                    : null;
+                const activeRecoverySessionId = automationControlState.activeRecoverySessionId;
+                const isStaleUnloadStop = stopReason === 'PAGE_UNLOAD'
+                    && recoverySessionId
+                    && activeRecoverySessionId
+                    && recoverySessionId !== activeRecoverySessionId;
+
+                if (isStaleUnloadStop) {
+                    automationControlState.lastCommandAt = Date.now();
+                    return {
+                        ok: true,
+                        command,
+                        ignored: true,
+                        reason: stopReason,
+                        recoverySessionId,
+                        state: buildAutomationStateSnapshot()
+                    };
+                }
+
+                resetAutomationModuleStates();
+                automationControlState.running = false;
+                automationControlState.activeRecoverySessionId = null;
+                automationControlState.currentMode = null;
+                automationControlState.connected = false;
+                automationControlState.lastCommandAt = Date.now();
+
+                return {
+                    ok: true,
+                    command,
+                    reason: stopReason,
+                    recoverySessionId,
+                    state: buildAutomationStateSnapshot()
+                };
+            }
+            case 'AUTOMATION_STATE_UPDATE': {
+                const mode = typeof payload?.mode === 'string' ? payload.mode.trim() : '';
+                if (!AUTOMATION_MODES.has(mode)) {
+                    return {
+                        ok: false,
+                        error: 'INVALID_AUTOMATION_MODE',
+                        command
+                    };
+                }
+
+                const fields = payload?.fields;
+                if (!fields || typeof fields !== 'object') {
+                    return {
+                        ok: false,
+                        error: 'INVALID_AUTOMATION_STATE_FIELDS',
+                        command
+                    };
+                }
+
+                const target = automationControlState.moduleStates[mode];
+                let updated = false;
+
+                if (Object.prototype.hasOwnProperty.call(fields, 'currentScreen')) {
+                    const nextScreen = typeof fields.currentScreen === 'string' && fields.currentScreen.trim()
+                        ? fields.currentScreen.trim()
+                        : null;
+                    if (target.currentScreen !== nextScreen) {
+                        target.currentScreen = nextScreen;
+                        updated = true;
+                    }
+                }
+
+                if (Object.prototype.hasOwnProperty.call(fields, 'completionCount')) {
+                    const nextCount = Number(fields.completionCount);
+                    if (Number.isFinite(nextCount) && nextCount >= 0) {
+                        const normalizedCount = Math.floor(nextCount);
+                        if (target.completionCount !== normalizedCount) {
+                            target.completionCount = normalizedCount;
+                            updated = true;
+                        }
+                    }
+                }
+
+                if (updated) {
+                    target.lastUpdateAt = Date.now();
+                    automationControlState.lastCommandAt = target.lastUpdateAt;
+                }
+
+                return {
+                    ok: true,
+                    command,
+                    mode,
+                    updated,
+                    state: buildAutomationStateSnapshot()
+                };
+            }
+            case 'GET_STATE': {
+                return {
+                    ok: true,
+                    command,
+                    state: buildAutomationStateSnapshot()
+                };
             }
             default:
                 return {
