@@ -12,6 +12,15 @@ const { createSettingsStore, DEFAULT_SETTINGS } = require('./settings-store');
 const automationConfigStore = require('./automation-config-store');
 const { minCraveAutoVersion } = require('../package.json');
 
+// [Muramasa Forge] 多实例支持：通过 --instance=<id> 隔离 userData 目录
+// 使用方式：npm start -- --instance=2 或 "Crave Saga.exe" --instance=2
+const instanceId = app.commandLine.getSwitchValue('instance');
+if (instanceId && /^[a-zA-Z0-9_-]+$/.test(instanceId)) {
+    const isolatedPath = path.join(app.getPath('userData'), `instance-${instanceId}`);
+    app.setPath('userData', isolatedPath);
+    console.log(`[MultiInstance] userData 隔离到: ${isolatedPath}`);
+}
+
 let mainWindow;
 let mainWindowWebSecurity = null;
 let webSecuritySwitchInProgress = false;
@@ -140,7 +149,13 @@ const automationControlState = {
     explicitlyStopped: false,
     activeRecoverySessionId: null,
     currentMode: null,
-    lastSelectedMode: null,
+    lastSelectedMode: (() => {
+        try {
+            const stored = automationConfigStore.getAll();
+            const m = stored && stored.lastSelectedMode;
+            return (typeof m === 'string' && AUTOMATION_MODES.has(m)) ? m : null;
+        } catch (_e) { return null; }
+    })(),
     lastStartConfig: {
         raidFilter: undefined,
         activeServerRegion: 'jp',
@@ -2361,8 +2376,17 @@ function createWindow(options = {}) {
 // ─── Automation Server (CraveAuto sidecar bridge) ────────────────────────────
 
 const AUTOMATION_SERVER_HOST = '127.0.0.1';
-const AUTOMATION_SERVER_PORT = 9223;
-const AUTOMATION_TOKEN_PATH = path.join(os.homedir(), '.cravesaga_bridge_token');
+// 多实例时根据 instanceId 偏移端口，避免冲突（默认 9223，instance-2 → 9224，instance-3 → 9225...）
+const AUTOMATION_SERVER_PORT = (() => {
+    const id = app.commandLine.getSwitchValue('instance');
+    if (id && /^\d+$/.test(id)) return 9223 + (parseInt(id, 10) - 1);
+    return 9223;
+})();
+const AUTOMATION_TOKEN_PATH = (() => {
+    const id = app.commandLine.getSwitchValue('instance');
+    if (id && /^[a-zA-Z0-9_-]+$/.test(id)) return path.join(os.homedir(), `.cravesaga_bridge_token_${id}`);
+    return path.join(os.homedir(), '.cravesaga_bridge_token');
+})();
 
 const AUTOMATION_RAID_LOG_LIMIT = 10;
 const AUTOMATION_REQUEST_MAX_BYTES = 1 * 1024 * 1024; // 1 MB
@@ -3221,13 +3245,24 @@ async function runCommandDispatcher(command, payload) {
                 return { ok: sent, command, type };
             }
             case 'START_AUTOMATION': {
-                const normalized = resolveStartPayload(payload);
+                let normalized = resolveStartPayload(payload);
+                // 浮动按钮无参启动 fallback：从上次保存的模式和配置重建 payload
+                if (!normalized && (!payload || !payload.mode)) {
+                    const lastMode = automationControlState.lastSelectedMode
+                        || (automationConfigStore.getAll() || {}).lastSelectedMode;
+                    if (lastMode && AUTOMATION_MODES.has(lastMode)) {
+                        const recoveryPayload = buildRecoveryStartPayload();
+                        if (recoveryPayload) {
+                            normalized = resolveStartPayload({ mode: lastMode, config: recoveryPayload });
+                        }
+                    }
+                }
                 if (!normalized) {
                     return {
                         ok: false,
                         error: 'INVALID_AUTOMATION_START_PAYLOAD',
                         command,
-                        message: 'START_AUTOMATION requires payload.mode in allowed modes.'
+                        message: 'START_AUTOMATION requires payload.mode in allowed modes, or a previously saved mode.'
                     };
                 }
 
@@ -3248,6 +3283,7 @@ async function runCommandDispatcher(command, payload) {
                 automationControlState.activeRecoverySessionId = recoverySessionId;
                 automationControlState.currentMode = normalized.mode;
                 automationControlState.lastSelectedMode = normalized.mode;
+                automationConfigStore.merge({ lastSelectedMode: normalized.mode });
                 automationControlState.lastStartConfig = {
                     raidFilter: normalized.commandPayload.raidFilter,
                     activeServerRegion: normalized.activeServerRegion,
@@ -3425,6 +3461,38 @@ async function runCommandDispatcher(command, payload) {
                     mode,
                     updated,
                     state: buildAutomationStateSnapshot()
+                };
+            }
+            case 'CRAVE_SAGA_DUMP_UI': {
+                const sent = emitRendererCommand('CRAVE_SAGA_DUMP_UI', {
+                    action: 'CRAVE_SAGA_DUMP_UI'
+                });
+                return { ok: sent, command };
+            }
+            case 'SCAN_FAVORITE_QUESTS': {
+                const sent = emitRendererCommand('SCAN_FAVORITE_QUESTS', {
+                    action: 'SCAN_FAVORITE_QUESTS'
+                });
+                return { ok: sent, command };
+            }
+            case 'FAVORITE_SCAN_RESULT': {
+                const items = Array.isArray(payload?.items) ? payload.items : [];
+                automationControlState.lastFavoriteScanResult = items;
+                automationControlState.lastFavoriteScanAt = Date.now();
+                // 推送给面板窗口
+                if (hasSidecarPanelWindow()) {
+                    try {
+                        sidecarPanelWindow.webContents.send('favorite-scan-result', items);
+                    } catch (_e) { /* 面板可能已关闭 */ }
+                }
+                return { ok: true, command, count: items.length };
+            }
+            case 'GET_FAVORITE_SCAN_RESULT': {
+                return {
+                    ok: true,
+                    command,
+                    items: automationControlState.lastFavoriteScanResult || [],
+                    scannedAt: automationControlState.lastFavoriteScanAt || null
                 };
             }
             case 'GET_STATE': {

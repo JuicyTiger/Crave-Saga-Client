@@ -1687,11 +1687,165 @@ window.addEventListener('DOMContentLoaded', () => {
                     applyWrapperShellStripForSubframe();
                 }
                 installSubframeMainEventBridge();
+                // ── 浮动控制按钮（Shadow DOM 隔离） ──────────────────────────
+                function createFloatingController() {
+                    if (document.getElementById('crave-saga-fab-host')) return;
+
+                    var host = document.createElement('div');
+                    host.id = 'crave-saga-fab-host';
+                    host.setAttribute(subframeGameKeepAttr, '1');
+                    (document.documentElement || document.body).appendChild(host);
+
+                    var shadow = host.attachShadow({ mode: 'closed' });
+
+                    var style = document.createElement('style');
+                    style.textContent = [
+                        ':host {',
+                        '  position: fixed !important;',
+                        '  top: 35% !important;',
+                        '  right: 0 !important;',
+                        '  bottom: auto !important;',
+                        '  left: auto !important;',
+                        '  transform: translateY(-50%) !important;',
+                        '  z-index: 2147483647 !important;',
+                        '  margin-right: -12px !important;',
+                        '  transition: margin-right 0.3s cubic-bezier(0.175,0.885,0.32,1.275) !important;',
+                        '}',
+                        ':host(:hover) { margin-right: 0; }',
+                        '.fab-btn {',
+                        '  width: 36px; height: 36px; border-radius: 18px 0 0 18px;',
+                        '  cursor: pointer; display: flex; align-items: center; justify-content: center;',
+                        '  backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);',
+                        '  border: 1px solid rgba(255,255,255,0.2); border-right: none;',
+                        '  box-shadow: -2px 0 10px rgba(0,0,0,0.2); transition: all 0.3s ease;',
+                        '}',
+                        '.fab-btn.is-stopped { background-color: rgba(34,197,94,0.5); }',
+                        '.fab-btn.is-stopped:hover { background-color: rgba(34,197,94,0.7); }',
+                        '.fab-btn.is-stopped .icon {',
+                        '  width: 0; height: 0;',
+                        '  border-top: 6px solid transparent; border-bottom: 6px solid transparent;',
+                        '  border-left: 10px solid rgba(255,255,255,0.95);',
+                        '  margin-left: 2px; transition: all 0.3s ease;',
+                        '}',
+                        '.fab-btn.is-running { background-color: rgba(239,68,68,0.5); }',
+                        '.fab-btn.is-running:hover { background-color: rgba(239,68,68,0.7); box-shadow: -2px 0 14px rgba(239,68,68,0.4); }',
+                        '.fab-btn.is-running .icon {',
+                        '  width: 10px; height: 10px; background-color: rgba(255,255,255,0.95);',
+                        '  border-width: 0; margin-left: 0; border-radius: 2px; transition: all 0.3s ease;',
+                        '}',
+                        '.fab-tool-btn {',
+                        '  width: 28px; height: 28px; border-radius: 14px 0 0 14px;',
+                        '  cursor: pointer; display: flex; align-items: center; justify-content: center;',
+                        '  background-color: rgba(147,51,234,0.4);',
+                        '  backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);',
+                        '  border: 1px solid rgba(255,255,255,0.15); border-right: none;',
+                        '  box-shadow: -2px 0 8px rgba(0,0,0,0.2); transition: all 0.3s ease; margin-top: 8px;',
+                        '}',
+                        '.fab-tool-btn:hover { background-color: rgba(147,51,234,0.7); transform: translateX(-3px); }',
+                        '.fab-tool-btn .icon { font-size: 13px; line-height: 1; filter: grayscale(100%) brightness(200%); }'
+                    ].join('\\n');
+
+                    var container = document.createElement('div');
+                    container.style.cssText = 'display:flex;flex-direction:column;align-items:flex-end;';
+
+                    // 启动/停止按钮
+                    var mainBtn = document.createElement('div');
+                    mainBtn.className = 'fab-btn is-stopped';
+                    mainBtn.title = '启动 / 停止自动化';
+                    var mainIcon = document.createElement('div');
+                    mainIcon.className = 'icon';
+                    mainBtn.appendChild(mainIcon);
+
+                    // 面板切换按钮
+                    var panelBtn = document.createElement('div');
+                    panelBtn.className = 'fab-tool-btn';
+                    panelBtn.title = '显示/隐藏控制面板 (P)';
+                    var panelIcon = document.createElement('div');
+                    panelIcon.className = 'icon';
+                    panelIcon.textContent = '\\u{1F4CB}';
+                    panelBtn.appendChild(panelIcon);
+
+                    // Dump UI 按钮
+                    var dumpBtn = document.createElement('div');
+                    dumpBtn.className = 'fab-tool-btn';
+                    dumpBtn.title = '打印场景树到控制台';
+                    var dumpIcon = document.createElement('div');
+                    dumpIcon.className = 'icon';
+                    dumpIcon.textContent = '\\u{1F50D}';
+                    dumpBtn.appendChild(dumpIcon);
+
+                    container.appendChild(mainBtn);
+                    container.appendChild(panelBtn);
+                    container.appendChild(dumpBtn);
+                    shadow.appendChild(style);
+                    shadow.appendChild(container);
+
+                    var fabCurrentRunning = false;
+
+                    function fabRunCommand(cmd, payload) {
+                        if (!window.electronAPI || typeof window.electronAPI.runCommand !== 'function') {
+                            return Promise.resolve({ ok: false, error: 'API_UNAVAILABLE' });
+                        }
+                        return window.electronAPI.runCommand(cmd, payload);
+                    }
+
+                    mainBtn.addEventListener('click', function(e) {
+                        e.stopPropagation();
+                        e.preventDefault();
+                        var cmd = fabCurrentRunning ? 'STOP_AUTOMATION' : 'START_AUTOMATION';
+                        fabRunCommand(cmd).then(function(resp) {
+                            if (resp && !resp.ok) {
+                                console.warn('[FAB] ' + cmd + ' 命令执行失败:', resp.error || resp.message);
+                            }
+                        }).catch(function(err) {
+                            console.warn('[FAB] ' + cmd + ' 命令异常:', err);
+                        });
+                    });
+
+                    panelBtn.addEventListener('click', function(e) {
+                        e.stopPropagation();
+                        e.preventDefault();
+                        fabRunCommand('TOGGLE_PANEL').catch(function() {});
+                    });
+
+                    dumpBtn.addEventListener('click', function(e) {
+                        e.stopPropagation();
+                        e.preventDefault();
+                        fabRunCommand('CRAVE_SAGA_DUMP_UI').then(function(resp) {
+                            if (resp && !resp.ok) {
+                                console.warn('[FAB] DUMP_UI 命令执行失败:', resp.error);
+                            }
+                        }).catch(function() {});
+                    });
+
+                    // 每 2 秒轮询状态，同步按钮外观
+                    setInterval(function() {
+                        fabRunCommand('GET_STATE').then(function(resp) {
+                            if (!resp || !resp.ok || !resp.state) return;
+                            var isRunning = !!resp.state.running;
+                            if (isRunning !== fabCurrentRunning) {
+                                fabCurrentRunning = isRunning;
+                                mainBtn.className = 'fab-btn ' + (isRunning ? 'is-running' : 'is-stopped');
+                            }
+                        }).catch(function() {});
+                    }, 2000);
+
+                    console.log('[CSC] 浮动控制按钮已创建');
+                }
+
                 if (isGamePage) {
                     sanitizeGame();
                     installSubframeRightClickLongPress();
                     installSubframeCacheLoader();
                     installSubframeCustomScriptsLoader();
+                    try {
+                        console.log('[CSC][FAB-DIAG] isGamePage=true, 准备创建浮动控制按钮...');
+                        createFloatingController();
+                    } catch (fabError) {
+                        console.error('[CSC][FAB-DIAG] createFloatingController 异常:', fabError);
+                    }
+                } else {
+                    console.log('[CSC][FAB-DIAG] isGamePage=false, 跳过浮动控制按钮。 URL:', window.location.href);
                 }
             })();
         `;
@@ -3218,6 +3372,154 @@ window.addEventListener('DOMContentLoaded', () => {
                 scheduleAudioSync();
                 installMainEventBridge();
                 loadCustomScripts();
+
+                // ── 主框架浮动控制按钮（用于台服等直接加载游戏页面的 provider） ──
+                function createFloatingController() {
+                    if (document.getElementById('crave-saga-fab-host')) return;
+
+                    var host = document.createElement('div');
+                    host.id = 'crave-saga-fab-host';
+                    (document.documentElement || document.body).appendChild(host);
+
+                    var shadow = host.attachShadow({ mode: 'closed' });
+
+                    var style = document.createElement('style');
+                    style.textContent = [
+                        ':host {',
+                        '  position: fixed !important;',
+                        '  top: 35% !important;',
+                        '  right: 0 !important;',
+                        '  bottom: auto !important;',
+                        '  left: auto !important;',
+                        '  transform: translateY(-50%) !important;',
+                        '  z-index: 2147483647 !important;',
+                        '  margin-right: -12px !important;',
+                        '  transition: margin-right 0.3s cubic-bezier(0.175,0.885,0.32,1.275) !important;',
+                        '}',
+                        ':host(:hover) { margin-right: 0; }',
+                        '.fab-btn {',
+                        '  width: 36px; height: 36px; border-radius: 18px 0 0 18px;',
+                        '  cursor: pointer; display: flex; align-items: center; justify-content: center;',
+                        '  backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);',
+                        '  border: 1px solid rgba(255,255,255,0.2); border-right: none;',
+                        '  box-shadow: -2px 0 10px rgba(0,0,0,0.2); transition: all 0.3s ease;',
+                        '}',
+                        '.fab-btn.is-stopped { background-color: rgba(34,197,94,0.5); }',
+                        '.fab-btn.is-stopped:hover { background-color: rgba(34,197,94,0.7); }',
+                        '.fab-btn.is-stopped .icon {',
+                        '  width: 0; height: 0;',
+                        '  border-top: 6px solid transparent; border-bottom: 6px solid transparent;',
+                        '  border-left: 10px solid rgba(255,255,255,0.95);',
+                        '  margin-left: 2px; transition: all 0.3s ease;',
+                        '}',
+                        '.fab-btn.is-running { background-color: rgba(239,68,68,0.5); }',
+                        '.fab-btn.is-running:hover { background-color: rgba(239,68,68,0.7); box-shadow: -2px 0 14px rgba(239,68,68,0.4); }',
+                        '.fab-btn.is-running .icon {',
+                        '  width: 10px; height: 10px; background-color: rgba(255,255,255,0.95);',
+                        '  border-width: 0; margin-left: 0; border-radius: 2px; transition: all 0.3s ease;',
+                        '}',
+                        '.fab-tool-btn {',
+                        '  width: 28px; height: 28px; border-radius: 14px 0 0 14px;',
+                        '  cursor: pointer; display: flex; align-items: center; justify-content: center;',
+                        '  background-color: rgba(147,51,234,0.4);',
+                        '  backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);',
+                        '  border: 1px solid rgba(255,255,255,0.15); border-right: none;',
+                        '  box-shadow: -2px 0 8px rgba(0,0,0,0.2); transition: all 0.3s ease; margin-top: 8px;',
+                        '}',
+                        '.fab-tool-btn:hover { background-color: rgba(147,51,234,0.7); transform: translateX(-3px); }',
+                        '.fab-tool-btn .icon { font-size: 13px; line-height: 1; filter: grayscale(100%) brightness(200%); }'
+                    ].join('\\n');
+
+                    var container = document.createElement('div');
+                    container.style.cssText = 'display:flex;flex-direction:column;align-items:flex-end;';
+
+                    var mainBtn = document.createElement('div');
+                    mainBtn.className = 'fab-btn is-stopped';
+                    mainBtn.title = '启动 / 停止自动化';
+                    var mainIcon = document.createElement('div');
+                    mainIcon.className = 'icon';
+                    mainBtn.appendChild(mainIcon);
+
+                    var panelBtn = document.createElement('div');
+                    panelBtn.className = 'fab-tool-btn';
+                    panelBtn.title = '显示/隐藏控制面板 (P)';
+                    var panelIcon = document.createElement('div');
+                    panelIcon.className = 'icon';
+                    panelIcon.textContent = '\\u{1F4CB}';
+                    panelBtn.appendChild(panelIcon);
+
+                    var dumpBtn = document.createElement('div');
+                    dumpBtn.className = 'fab-tool-btn';
+                    dumpBtn.title = '打印场景树到控制台';
+                    var dumpIcon = document.createElement('div');
+                    dumpIcon.className = 'icon';
+                    dumpIcon.textContent = '\\u{1F50D}';
+                    dumpBtn.appendChild(dumpIcon);
+
+                    container.appendChild(mainBtn);
+                    container.appendChild(panelBtn);
+                    container.appendChild(dumpBtn);
+                    shadow.appendChild(style);
+                    shadow.appendChild(container);
+
+                    var fabCurrentRunning = false;
+
+                    function fabRunCommand(cmd, payload) {
+                        if (!window.electronAPI || typeof window.electronAPI.runCommand !== 'function') {
+                            return Promise.resolve({ ok: false, error: 'API_UNAVAILABLE' });
+                        }
+                        return window.electronAPI.runCommand(cmd, payload);
+                    }
+
+                    mainBtn.addEventListener('click', function(e) {
+                        e.stopPropagation();
+                        e.preventDefault();
+                        var cmd = fabCurrentRunning ? 'STOP_AUTOMATION' : 'START_AUTOMATION';
+                        fabRunCommand(cmd).then(function(resp) {
+                            if (resp && !resp.ok) {
+                                console.warn('[FAB] ' + cmd + ' 命令执行失败:', resp.error || resp.message);
+                            }
+                        }).catch(function(err) {
+                            console.warn('[FAB] ' + cmd + ' 命令异常:', err);
+                        });
+                    });
+
+                    panelBtn.addEventListener('click', function(e) {
+                        e.stopPropagation();
+                        e.preventDefault();
+                        fabRunCommand('TOGGLE_PANEL').catch(function() {});
+                    });
+
+                    dumpBtn.addEventListener('click', function(e) {
+                        e.stopPropagation();
+                        e.preventDefault();
+                        fabRunCommand('CRAVE_SAGA_DUMP_UI').then(function(resp) {
+                            if (resp && !resp.ok) {
+                                console.warn('[FAB] DUMP_UI 命令执行失败:', resp.error);
+                            }
+                        }).catch(function() {});
+                    });
+
+                    setInterval(function() {
+                        fabRunCommand('GET_STATE').then(function(resp) {
+                            if (!resp || !resp.ok || !resp.state) return;
+                            var isRunning = !!resp.state.running;
+                            if (isRunning !== fabCurrentRunning) {
+                                fabCurrentRunning = isRunning;
+                                mainBtn.className = 'fab-btn ' + (isRunning ? 'is-running' : 'is-stopped');
+                            }
+                        }).catch(function() {});
+                    }, 2000);
+
+                    console.log('[CSC] 浮动控制按钮已创建（主框架）');
+                }
+
+                try {
+                    createFloatingController();
+                } catch (fabError) {
+                    console.error('[CSC][FAB-DIAG] 主框架 createFloatingController 异常:', fabError);
+                }
+
                 if (window.electronAPI && typeof window.electronAPI.markProviderSuccess === 'function') {
                     try {
                         var markSuccessPromise = window.electronAPI.markProviderSuccess({ success: true });

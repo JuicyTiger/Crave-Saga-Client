@@ -5,6 +5,8 @@ const ALLOWED_COMMANDS = new Set([
     'START_AUTOMATION',
     'STOP_AUTOMATION',
     'SCAN_FAVORITE_QUESTS',
+    'GET_FAVORITE_SCAN_RESULT',
+    'CRAVE_SAGA_DUMP_UI',
     'GET_AUTOMATION_CONFIG',
     'SET_AUTOMATION_CONFIG',
     'SHOW_PANEL',
@@ -35,6 +37,12 @@ contextBridge.exposeInMainWorld('panelAPI', {
                 command: normalized,
                 message: error?.message || String(error)
             }));
+    },
+    onFavoriteScanResult: (callback) => {
+        if (typeof callback !== 'function') return;
+        ipcRenderer.on('favorite-scan-result', (event, items) => {
+            callback(items);
+        });
     }
 });
 
