@@ -1631,7 +1631,6 @@ window.addEventListener('DOMContentLoaded', () => {
                         }
 
                         if (command === 'setMuteAll' || command === 'setMuteBgm' || command === 'setMuteSe') {
-                            if (!getSubframeSoundManager()) return;
                             applySubframeMuteCommand(command, payload);
                             return;
                         }
@@ -1836,6 +1835,25 @@ window.addEventListener('DOMContentLoaded', () => {
 
                 if (isGamePage) {
                     sanitizeGame();
+
+                    // 子框架启动时从 settings-store 恢复音频静音状态（对标主框架 L3380-3381 的 scheduleAudioSync）。
+                    // 确保 fanza/dmm 等子框架路径在应用重启后也能正确恢复静音。
+                    if (window.electronAPI && typeof window.electronAPI.getSettings === 'function') {
+                        try {
+                            var initSettings = window.electronAPI.getSettings();
+                            var initAudio = initSettings && initSettings.audio && typeof initSettings.audio === 'object'
+                                ? initSettings.audio : null;
+                            if (initAudio && (initAudio.muteAll || initAudio.muteBgm || initAudio.muteSe)) {
+                                subframeAudioState.muteAll = !!initAudio.muteAll;
+                                subframeAudioState.muteBgm = !!(initAudio.muteAll || initAudio.muteBgm);
+                                subframeAudioState.muteSe = !!(initAudio.muteAll || initAudio.muteSe);
+                                scheduleSubframeAudioApply(300);
+                            }
+                        } catch (audioInitError) {
+                            console.warn('[CSC] (Subframe) 初始化音频状态恢复失败:', audioInitError);
+                        }
+                    }
+
                     installSubframeRightClickLongPress();
                     installSubframeCacheLoader();
                     installSubframeCustomScriptsLoader();
