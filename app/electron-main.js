@@ -146,7 +146,7 @@ const AUTOMATION_MODES = new Set(['descentRaid', 'regularRaid', 'favoriteQuest',
 const automationControlState = {
     connected: false,
     running: false,
-    explicitlyStopped: false,
+    explicitlyStopped: true,
     activeRecoverySessionId: null,
     currentMode: null,
     lastSelectedMode: (() => {
@@ -287,8 +287,25 @@ function buildRecoveryStartPayload(recoverySessionId = null) {
         persistedConfig = automationConfigStore.getAll() || {};
     } catch (_e) { /* 读取失败时使用空对象 */ }
 
+    // raidFilter 优先使用内存中的 lastStartConfig 副本（页面刷新场景仍存活）；
+    // 若内存副本丢失（如应用重启后的理论路径），从持久化的模式专用配置中派生。
+    let effectiveRaidFilter = cfg.raidFilter;
+    if (!effectiveRaidFilter) {
+        const MODE_FILTER_KEY_MAP = {
+            descentRaid: 'descentRaidFilter',
+            regularRaid: 'regularRaidFilter',
+            favoriteQuest: 'favoriteQuestFilter',
+            forging: 'forgingFilter',
+            tower_subjection: 'towerSubjectionFilter'
+        };
+        const filterKey = MODE_FILTER_KEY_MAP[mode];
+        if (filterKey && persistedConfig[filterKey]) {
+            effectiveRaidFilter = persistedConfig[filterKey];
+        }
+    }
+
     const mergedConfig = {
-        raidFilter: cfg.raidFilter,
+        raidFilter: effectiveRaidFilter,
         ...persistedConfig
     };
 
@@ -296,7 +313,7 @@ function buildRecoveryStartPayload(recoverySessionId = null) {
         action: 'CRAVE_SAGA_START',
         mode,
         config: mergedConfig,
-        raidFilter: cfg.raidFilter,
+        raidFilter: effectiveRaidFilter,
         serverRegion,
         serverHost: serverHost || null,
         recoverySessionId: typeof recoverySessionId === 'string' && recoverySessionId.trim()
@@ -3363,6 +3380,26 @@ async function runCommandDispatcher(command, payload) {
                     }
                 }
 
+                // 子框架引擎就绪后，重新下发所有非默认的渲染器状态命令。
+                // 页面刷新或应用重启后，渲染器侧的帧率限制和音频静音会被重置，
+                // 但主进程的 gameCommandState 仍保留（内存或从 settings-store 恢复），
+                // 需要在此处重新同步，避免菜单状态与实际行为不一致。
+                if (connected) {
+                    if (gameCommandState.frameRate !== 0) {
+                        emitRendererCommand('setFrameRate', { fps: gameCommandState.frameRate });
+                    }
+                    if (gameCommandState.muteAll) {
+                        emitRendererCommand('setMuteAll', { enabled: true });
+                    } else {
+                        if (gameCommandState.muteBgm) {
+                            emitRendererCommand('setMuteBgm', { enabled: true });
+                        }
+                        if (gameCommandState.muteSe) {
+                            emitRendererCommand('setMuteSe', { enabled: true });
+                        }
+                    }
+                }
+
                 return {
                     ok: true,
                     command,
@@ -3398,6 +3435,13 @@ async function runCommandDispatcher(command, payload) {
                 automationControlState.currentMode = null;
                 automationControlState.connected = false;
                 automationControlState.lastCommandAt = Date.now();
+
+                // 非 PAGE_UNLOAD 的内源性停机（业务模块触发的体力耗尽、任务完成等）：
+                // 标记为显式停止，阻止后续页面刷新触发自动恢复。
+                // PAGE_UNLOAD 保持 explicitlyStopped 不变，允许脚本主动刷新后的恢复流程。
+                if (stopReason !== 'PAGE_UNLOAD') {
+                    automationControlState.explicitlyStopped = true;
+                }
 
                 return {
                     ok: true,
