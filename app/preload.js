@@ -154,6 +154,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     setProviderLanguagePreference: (provider, lang) =>
         ipcRenderer.invoke('set-provider-language-preference', { provider, lang }).catch(() => false),
     getCustomScripts: () => ipcRenderer.invoke('get-custom-scripts').catch(() => []),
+    hasAutomationBundle: () => ipcRenderer.invoke('has-automation-bundle').catch(() => false),
     updateTrayStatus: (data) => ipcRenderer.send('set-tray-status', data),
     getProxyPort: () => ipcRenderer.invoke('get-proxy-port'),
     setCacheConfig: (data) => ipcRenderer.send('set-cache-config', data),
@@ -1838,11 +1839,19 @@ window.addEventListener('DOMContentLoaded', () => {
                     installSubframeRightClickLongPress();
                     installSubframeCacheLoader();
                     installSubframeCustomScriptsLoader();
-                    try {
-                        console.log('[CSC][FAB-DIAG] isGamePage=true, 准备创建浮动控制按钮...');
-                        createFloatingController();
-                    } catch (fabError) {
-                        console.error('[CSC][FAB-DIAG] createFloatingController 异常:', fabError);
+                    // 浮动按钮仅在 injected.bundle.js 存在时创建
+                    if (window.electronAPI && typeof window.electronAPI.hasAutomationBundle === 'function') {
+                        window.electronAPI.hasAutomationBundle().then(function(exists) {
+                            if (!exists) {
+                                console.log('[CSC][FAB] injected.bundle.js 不存在，跳过浮动按钮创建');
+                                return;
+                            }
+                            try {
+                                createFloatingController();
+                            } catch (fabError) {
+                                console.error('[CSC][FAB-DIAG] createFloatingController 异常:', fabError);
+                            }
+                        }).catch(function() {});
                     }
                 } else {
                     console.log('[CSC][FAB-DIAG] isGamePage=false, 跳过浮动控制按钮。 URL:', window.location.href);
@@ -3514,10 +3523,19 @@ window.addEventListener('DOMContentLoaded', () => {
                     console.log('[CSC] 浮动控制按钮已创建（主框架）');
                 }
 
-                try {
-                    createFloatingController();
-                } catch (fabError) {
-                    console.error('[CSC][FAB-DIAG] 主框架 createFloatingController 异常:', fabError);
+                // 浮动按钮仅在 injected.bundle.js 存在时创建
+                if (window.electronAPI && typeof window.electronAPI.hasAutomationBundle === 'function') {
+                    window.electronAPI.hasAutomationBundle().then(function(exists) {
+                        if (!exists) {
+                            console.log('[CSC][FAB] injected.bundle.js 不存在，跳过浮动按钮创建（主框架）');
+                            return;
+                        }
+                        try {
+                            createFloatingController();
+                        } catch (fabError) {
+                            console.error('[CSC][FAB-DIAG] 主框架 createFloatingController 异常:', fabError);
+                        }
+                    }).catch(function() {});
                 }
 
                 if (window.electronAPI && typeof window.electronAPI.markProviderSuccess === 'function') {

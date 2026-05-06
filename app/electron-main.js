@@ -3799,6 +3799,11 @@ ipcMain.handle('get-custom-scripts', () => {
     return loadCustomScripts();
 });
 
+ipcMain.handle('has-automation-bundle', () => {
+    const bundlePath = path.join(CUSTOM_DIR_PATH, 'injected.bundle.js');
+    return fs.existsSync(bundlePath);
+});
+
 ipcMain.on('get-provider-state-sync', event => {
     event.returnValue = cloneProviderState();
 });
