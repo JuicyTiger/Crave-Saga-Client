@@ -143,6 +143,19 @@ const gameCommandState = {
 
 const AUTOMATION_MODES = new Set(['descentRaid', 'regularRaid', 'favoriteQuest', 'forging', 'tower_subjection']);
 
+/**
+ * 根据 provider 标识派生服务器区域。
+ * DMM / Fanza → 日服 (jp)，其余 → 台服 (tw)。
+ * provider 为空或未知时返回 null，不做静默 fallback。
+ */
+function deriveServerRegionFromProvider(provider) {
+    if (!provider || typeof provider !== 'string') return null;
+    const key = provider.trim().toLowerCase();
+    if (key === 'dmm' || key === 'fanza') return 'jp';
+    if (key) return 'tw';
+    return null;
+}
+
 const automationControlState = {
     connected: false,
     running: false,
@@ -158,7 +171,7 @@ const automationControlState = {
     })(),
     lastStartConfig: {
         raidFilter: undefined,
-        activeServerRegion: 'jp',
+        activeServerRegion: null,
         activeServerHost: null
     },
     moduleStates: {
@@ -168,7 +181,7 @@ const automationControlState = {
         forging: { active: false, currentScreen: null, completionCount: 0, lastUpdateAt: 0 },
         tower_subjection: { active: false, currentScreen: null, completionCount: 0, lastUpdateAt: 0 }
     },
-    activeServerRegion: 'jp',
+    activeServerRegion: null,
     activeServerHost: null,
     lastCommandAt: 0
 };
@@ -252,11 +265,11 @@ function resolveStartPayload(payload) {
             mode,
             config,
             raidFilter: config.raidFilter,
-            serverRegion: activeServerRegion || 'jp',
+            serverRegion: activeServerRegion,
             serverHost: activeServerHost || null,
             recoverySessionId
         },
-        activeServerRegion: activeServerRegion || 'jp',
+        activeServerRegion: activeServerRegion,
         activeServerHost: activeServerHost || null,
         recoverySessionId
     };
@@ -276,7 +289,7 @@ function buildRecoveryStartPayload(recoverySessionId = null) {
     const cfg = automationControlState.lastStartConfig || {};
     const serverRegion = typeof cfg.activeServerRegion === 'string' && cfg.activeServerRegion
         ? cfg.activeServerRegion
-        : (automationControlState.activeServerRegion || 'jp');
+        : automationControlState.activeServerRegion;
     const serverHost = Object.prototype.hasOwnProperty.call(cfg, 'activeServerHost')
         ? cfg.activeServerHost
         : automationControlState.activeServerHost;
@@ -1077,6 +1090,11 @@ function setProviderState(nextState = {}, options = {}) {
 
     if (hasDefaultProvider) {
         globalState.defaultProvider = safeTrimmedString(nextState.defaultProvider);
+        // provider 变更时同步派生服务器区域
+        const derivedRegion = deriveServerRegionFromProvider(globalState.defaultProvider);
+        if (derivedRegion) {
+            automationControlState.activeServerRegion = derivedRegion;
+        }
     }
 
     if (hasLoginRegex) {
@@ -3418,7 +3436,7 @@ async function runCommandDispatcher(command, payload) {
                                 automationControlState.activeRecoverySessionId = recoverySessionId;
                                 automationControlState.currentMode = recoveryPayload.mode;
                                 automationControlState.moduleStates[recoveryPayload.mode].active = true;
-                                automationControlState.activeServerRegion = recoveryPayload.serverRegion || 'jp';
+                                automationControlState.activeServerRegion = recoveryPayload.serverRegion || automationControlState.activeServerRegion;
                                 automationControlState.activeServerHost = recoveryPayload.serverHost || null;
                                 automationControlState.lastCommandAt = Date.now();
                             }
