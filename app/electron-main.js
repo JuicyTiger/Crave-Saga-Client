@@ -3327,15 +3327,31 @@ async function runCommandDispatcher(command, payload) {
             }
             case 'START_AUTOMATION': {
                 let normalized = resolveStartPayload(payload);
-                // 浮动按钮无参启动 fallback：从上次保存的模式和配置重建 payload
+                // 浮动按钮无参启动 fallback：从持久化配置中读取当前选中模式及其对应的筛选参数
                 if (!normalized && (!payload || !payload.mode)) {
-                    const lastMode = automationControlState.lastSelectedMode
-                        || (automationConfigStore.getAll() || {}).lastSelectedMode;
-                    if (lastMode && AUTOMATION_MODES.has(lastMode)) {
-                        const recoveryPayload = buildRecoveryStartPayload();
-                        if (recoveryPayload) {
-                            normalized = resolveStartPayload({ mode: lastMode, config: recoveryPayload });
-                        }
+                    let persistedCfg = {};
+                    try { persistedCfg = automationConfigStore.getAll() || {}; } catch (_e) { /* 忽略 */ }
+                    const selectedMode = automationControlState.lastSelectedMode
+                        || persistedCfg.lastSelectedMode;
+                    if (selectedMode && AUTOMATION_MODES.has(selectedMode)) {
+                        const MODE_FILTER_KEY_MAP = {
+                            descentRaid: 'descentRaidFilter',
+                            regularRaid: 'regularRaidFilter',
+                            favoriteQuest: 'favoriteQuestFilter',
+                            forging: 'forgingFilter',
+                            tower_subjection: 'towerSubjectionFilter'
+                        };
+                        const filterKey = MODE_FILTER_KEY_MAP[selectedMode];
+                        const modeFilter = (filterKey && persistedCfg[filterKey]) || undefined;
+                        normalized = resolveStartPayload({
+                            mode: selectedMode,
+                            config: {
+                                raidFilter: modeFilter,
+                                activeServerRegion: automationControlState.activeServerRegion,
+                                activeServerHost: automationControlState.activeServerHost,
+                                ...persistedCfg
+                            }
+                        });
                     }
                 }
                 if (!normalized) {
@@ -3621,6 +3637,10 @@ async function runCommandDispatcher(command, payload) {
                     };
                 }
                 const written = automationConfigStore.merge(payload);
+                // 同步更新内存中的 lastSelectedMode，确保浮动按钮 fallback 使用最新值
+                if (written && typeof payload.lastSelectedMode === 'string' && AUTOMATION_MODES.has(payload.lastSelectedMode)) {
+                    automationControlState.lastSelectedMode = payload.lastSelectedMode;
+                }
                 return {
                     ok: written,
                     command,
