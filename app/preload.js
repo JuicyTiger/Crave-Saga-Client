@@ -325,6 +325,7 @@ window.addEventListener('DOMContentLoaded', () => {
                         for (var i = 0; i < parent.children.length; i++) {
                             var sibling = parent.children[i];
                             if (sibling !== current) {
+                                if (sibling.tagName === 'INPUT' || sibling.tagName === 'TEXTAREA' || sibling.getAttribute('contenteditable') === 'true') continue;
                                 sibling.style.display = 'none';
                             }
                         }
@@ -486,7 +487,7 @@ window.addEventListener('DOMContentLoaded', () => {
                         style.id = styleId;
                         style.textContent =
                             'html, body { margin: 0 !important; overflow: hidden !important; background: #000 !important; height: 100% !important; }' +
-                            'body *:not([' + keepAttr + ']) { display: none !important; }' +
+                            'body *:not([' + keepAttr + ']):not(input):not(textarea):not([contenteditable="true"]) { display: none !important; }' +
                             '#GameDiv[' + keepAttr + '], #GameCanvas[' + keepAttr + '], canvas[' + keepAttr + '] { display: block !important; position: fixed !important; top: 0 !important; left: 0 !important; width: 100vw !important; height: 100vh !important; max-width: 100vw !important; max-height: 100vh !important; margin: 0 !important; border: 0 !important; z-index: 2147483647 !important; }';
                         (document.head || document.documentElement).appendChild(style);
                     }
