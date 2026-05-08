@@ -356,11 +356,13 @@ function syncAudioStateFromSettings() {
 }
 
 /**
- * 同步音频静音状态到所有子框架。
+ * 通过 webFrameMain.executeJavaScript() 直接在游戏子框架的页面世界中
+ * 操作 Grobal.SoundManager 来同步音频静音状态。
  *
- * 不再轮询 Grobal.SoundManager——静音通过注入脚本中的 cc.audioEngine patch
- * （installAudioEnginePatch）在引擎层面生效。executeJavaScript 设定全局状态后
- * 调用 __cscApplyMute()；若 patch 尚未安装，状态会被 patch 初始化时读取。
+ * 解决的问题：fanza/dmm 的游戏运行在子框架中，页面加载过程中可能产生
+ * 多个 VM 上下文（内部导航/iframe 重建）。通过 emitRendererCommand 经
+ * preload 事件桥中转的命令可能投递到已失效的旧 VM 上下文，被静默丢弃。
+ * 而 executeJavaScript 直接在当前活跃的页面世界中执行，始终命中正确上下文。
  */
 function syncAudioStateToGameFrames() {
     if (!mainWindow || mainWindow.isDestroyed()) return;
@@ -368,8 +370,25 @@ function syncAudioStateToGameFrames() {
     const muteAll = !!gameCommandState.muteAll;
     const muteBgm = !!(muteAll || gameCommandState.muteBgm);
     const muteSe = !!(muteAll || gameCommandState.muteSe);
+    if (!muteAll && !muteBgm && !muteSe) return;
 
-    const jsCode = `window.__cscMuteState={muteAll:${muteAll},muteBgm:${muteBgm},muteSe:${muteSe}};if(window.__cscApplyMute)window.__cscApplyMute();`;
+    const jsCode = `(function(){
+        var attempts=0;
+        var timer=setInterval(function(){
+            var sm=window.Grobal&&window.Grobal.SoundManager;
+            if(sm){
+                clearInterval(timer);
+                try{
+                    if(typeof sm.setBgmMute==='function')sm.setBgmMute(${muteBgm});
+                    if(typeof sm.setSeMute==='function')sm.setSeMute(${muteSe});
+                    if(typeof sm.setBattleSeMute==='function')sm.setBattleSeMute(${muteSe});
+                    if(typeof sm.setVoiceMute==='function')sm.setVoiceMute(${muteSe});
+                }catch(e){}
+                return;
+            }
+            if(++attempts>60){clearInterval(timer);}
+        },500);
+    })()`;
 
     try {
         const frames = mainWindow.webContents.mainFrame.framesInSubtree;
@@ -2424,7 +2443,6 @@ function createWindow(options = {}) {
     });
 
     mainWindow.webContents.on('did-finish-load', () => {
-        syncAudioStateToGameFrames();
         if (gameCommandState.blackout) {
             emitRendererCommand('setBlackout', { enabled: true });
             syncBlackoutPointerTracking();
@@ -3112,6 +3130,7 @@ async function runCommandDispatcher(command, payload) {
             }
         );
         const sent = emitRendererCommand('setMuteAll', { enabled });
+        // 精准注入：直接在游戏子框架页面世界中操作 SoundManager
         syncAudioStateToGameFrames();
         return { ok: sent, command, enabled };
     };
@@ -3128,7 +3147,6 @@ async function runCommandDispatcher(command, payload) {
             }
         );
         const sent = emitRendererCommand('setMuteBgm', { enabled });
-        syncAudioStateToGameFrames();
         return { ok: sent, command, enabled, muteAll: gameCommandState.muteAll };
     };
 
@@ -3144,7 +3162,6 @@ async function runCommandDispatcher(command, payload) {
             }
         );
         const sent = emitRendererCommand('setMuteSe', { enabled });
-        syncAudioStateToGameFrames();
         return { ok: sent, command, enabled, muteAll: gameCommandState.muteAll };
     };
 
@@ -3450,7 +3467,10 @@ async function runCommandDispatcher(command, payload) {
                     if (gameCommandState.frameRate !== 0) {
                         emitRendererCommand('setFrameRate', { fps: gameCommandState.frameRate });
                     }
-                    // 音频静音：通过 executeJavaScript 配合 cc.audioEngine patch 同步
+                    // 音频静音：通过 executeJavaScript 直接在游戏子框架页面世界中操作
+                    // Grobal.SoundManager，绕过多子框架 VM 上下文隔离和 SoundManager
+                    // 初始化时序问题（emitRendererCommand 经 preload 事件桥中转时，
+                    // 可能投递到已失效的 VM 上下文导致静默丢弃）。
                     syncAudioStateToGameFrames();
                 }
 

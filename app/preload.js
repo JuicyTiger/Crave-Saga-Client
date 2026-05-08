@@ -399,78 +399,6 @@ window.addEventListener('DOMContentLoaded', () => {
                 }
     `;
 
-    const injectedAudioPatchSource = `
-                function installAudioEnginePatch() {
-                    var KEY = '__csc_audio_patch';
-                    if (window[KEY]) return;
-                    window[KEY] = true;
-
-                    var muteState = window.__cscMuteState || { muteAll: false, muteBgm: false, muteSe: false };
-                    window.__cscMuteState = muteState;
-
-                    var attempts = 0;
-
-                    function tryInstall() {
-                        if (!window.cc || !window.cc.audioEngine) {
-                            if (++attempts < 300) setTimeout(tryInstall, 100);
-                            return;
-                        }
-
-                        var ae = window.cc.audioEngine;
-                        var _playMusic = ae.playMusic.bind(ae);
-                        var _playEffect = ae.playEffect.bind(ae);
-                        var _stopMusic = ae.stopMusic ? ae.stopMusic.bind(ae) : null;
-                        var _stopAllEffects = ae.stopAllEffects ? ae.stopAllEffects.bind(ae) : null;
-
-                        ae.playMusic = function(url, loop) {
-                            if (muteState.muteAll || muteState.muteBgm) return;
-                            return _playMusic(url, loop);
-                        };
-
-                        ae.playEffect = function(url, loop) {
-                            if (muteState.muteAll || muteState.muteSe) return;
-                            return _playEffect(url, loop);
-                        };
-
-                        if (muteState.muteAll || muteState.muteBgm) {
-                            try { ae.setMusicVolume(0); } catch(e) {}
-                            if (_stopMusic) try { _stopMusic(); } catch(e) {}
-                        }
-                        if (muteState.muteAll || muteState.muteSe) {
-                            try { ae.setEffectsVolume(0); } catch(e) {}
-                            if (_stopAllEffects) try { _stopAllEffects(); } catch(e) {}
-                        }
-                    }
-
-                    window.__cscApplyMute = function(state) {
-                        if (state) {
-                            if (typeof state.muteAll === 'boolean') muteState.muteAll = state.muteAll;
-                            if (typeof state.muteBgm === 'boolean') muteState.muteBgm = state.muteBgm;
-                            if (typeof state.muteSe === 'boolean') muteState.muteSe = state.muteSe;
-                        }
-                        if (window.cc && window.cc.audioEngine) {
-                            var ae = window.cc.audioEngine;
-                            if (muteState.muteAll || muteState.muteBgm) {
-                                try { ae.setMusicVolume(0); } catch(e) {}
-                                try { ae.stopMusic(); } catch(e) {}
-                            } else {
-                                try { ae.setMusicVolume(1); } catch(e) {}
-                            }
-                            if (muteState.muteAll || muteState.muteSe) {
-                                try { ae.setEffectsVolume(0); } catch(e) {}
-                                try { ae.stopAllEffects(); } catch(e) {}
-                            } else {
-                                try { ae.setEffectsVolume(1); } catch(e) {}
-                            }
-                        }
-                    };
-
-                    tryInstall();
-                }
-
-                installAudioEnginePatch();
-    `;
-
     const injectedDownloadPathLabelSource = `
                 function createPathLabel() {
                     var el = document.createElement('div');
@@ -503,7 +431,6 @@ window.addEventListener('DOMContentLoaded', () => {
                 ${injectedMaskHelpersSource}
                 ${injectedWrapperHelpersSource}
                 ${injectedDownloadPathLabelSource}
-                ${injectedAudioPatchSource}
 
                 function pickLargestIframe() {
                     var frames = document.querySelectorAll('iframe');
@@ -560,7 +487,6 @@ window.addEventListener('DOMContentLoaded', () => {
                         style.textContent =
                             'html, body { margin: 0 !important; overflow: hidden !important; background: #000 !important; height: 100% !important; }' +
                             'body *:not([' + keepAttr + ']) { display: none !important; }' +
-                            'input, textarea, [contenteditable="true"] { display: initial !important; visibility: visible !important; }' +
                             '#GameDiv[' + keepAttr + '], #GameCanvas[' + keepAttr + '], canvas[' + keepAttr + '] { display: block !important; position: fixed !important; top: 0 !important; left: 0 !important; width: 100vw !important; height: 100vh !important; max-width: 100vw !important; max-height: 100vh !important; margin: 0 !important; border: 0 !important; z-index: 2147483647 !important; }';
                         (document.head || document.documentElement).appendChild(style);
                     }
@@ -1284,6 +1210,86 @@ window.addEventListener('DOMContentLoaded', () => {
                     return 0;
                 }
 
+                function getSubframeSoundManager() {
+                    return window.Grobal && window.Grobal.SoundManager ? window.Grobal.SoundManager : null;
+                }
+
+                var subframeAudioState = {
+                    muteAll: false,
+                    muteBgm: false,
+                    muteSe: false
+                };
+                var subframeAudioApplyScheduled = false;
+
+                function applySubframeAudioStateNow() {
+                    var soundManager = getSubframeSoundManager();
+                    if (!soundManager) return false;
+
+                    var muteAll = !!subframeAudioState.muteAll;
+                    var muteBgm = !!subframeAudioState.muteBgm;
+                    var muteSe = !!subframeAudioState.muteSe;
+
+                    try {
+                        if (typeof soundManager.setBgmMute === 'function') {
+                            soundManager.setBgmMute(muteAll ? true : muteBgm);
+                        }
+                        if (typeof soundManager.setSeMute === 'function') {
+                            soundManager.setSeMute(muteAll ? true : muteSe);
+                        }
+                        if (typeof soundManager.setBattleSeMute === 'function') {
+                            soundManager.setBattleSeMute(muteAll ? true : muteSe);
+                        }
+                        if (typeof soundManager.setVoiceMute === 'function') {
+                            soundManager.setVoiceMute(muteAll ? true : muteSe);
+                        }
+                    } catch (e) {
+                        return false;
+                    }
+
+                    return true;
+                }
+
+                function scheduleSubframeAudioApply(maxAttempts) {
+                    if (subframeAudioApplyScheduled) return;
+                    subframeAudioApplyScheduled = true;
+
+                    var attempts = typeof maxAttempts === 'number' ? maxAttempts : 120;
+                    function tick() {
+                        if (applySubframeAudioStateNow()) {
+                            subframeAudioApplyScheduled = false;
+                            return;
+                        }
+                        attempts -= 1;
+                        if (attempts <= 0) {
+                            subframeAudioApplyScheduled = false;
+                            console.warn('[CSC] (Subframe) Audio state apply timed out');
+                            return;
+                        }
+                        requestAnimationFrame(tick);
+                    }
+
+                    requestAnimationFrame(tick);
+                }
+
+                function applySubframeMuteCommand(command, payload) {
+                    var enabled = resolveSubframeBooleanPayload(payload);
+                    if (enabled == null) return;
+
+                    if (command === 'setMuteAll') {
+                        subframeAudioState.muteAll = !!enabled;
+                        subframeAudioState.muteBgm = !!enabled;
+                        subframeAudioState.muteSe = !!enabled;
+                    } else if (command === 'setMuteBgm') {
+                        subframeAudioState.muteBgm = !!enabled;
+                        subframeAudioState.muteAll = subframeAudioState.muteBgm && subframeAudioState.muteSe;
+                    } else if (command === 'setMuteSe') {
+                        subframeAudioState.muteSe = !!enabled;
+                        subframeAudioState.muteAll = subframeAudioState.muteBgm && subframeAudioState.muteSe;
+                    }
+
+                    scheduleSubframeAudioApply(180);
+                }
+
                 function getSubframeGameCanvas() {
                     var canvases = getSubframeCanvasCandidates();
                     return canvases.length > 0 ? canvases[0] : null;
@@ -1624,6 +1630,11 @@ window.addEventListener('DOMContentLoaded', () => {
                             return;
                         }
 
+                        if (command === 'setMuteAll' || command === 'setMuteBgm' || command === 'setMuteSe') {
+                            applySubframeMuteCommand(command, payload);
+                            return;
+                        }
+
                         if (command === 'setBlackout') {
                             if (!getTrackedSubframeGameCanvas()) return;
                             applySubframeBlackoutCommand(payload);
@@ -1864,7 +1875,6 @@ window.addEventListener('DOMContentLoaded', () => {
             ${injectedMaskHelpersSource}
             ${injectedWrapperHelpersSource}
             ${injectedDownloadPathLabelSource}
-            ${injectedAudioPatchSource}
 
             var loginPatterns = compileRegexContractList(providerRegexContract.loginRegex, 'loginRegex', true);
             var pagePatterns = compileRegexContractList(providerRegexContract.pageRegex, 'pageRegex', true);
@@ -1994,17 +2004,6 @@ window.addEventListener('DOMContentLoaded', () => {
 
                         var hereUrl = normalizeUrl(window.location.href);
                         if (!hereUrl || targetUrl === hereUrl) continue;
-
-                        // 重定向循环保护：同一 session 内同一 wrapper URL 最多 promotion 2 次
-                        try {
-                            var loopKey = 'csc_promo_' + btoa(hereUrl).substring(0, 32);
-                            var promoCount = parseInt(sessionStorage.getItem(loopKey) || '0', 10);
-                            if (promoCount >= 2) {
-                                console.warn('[CSC] Promotion loop detected for', hereUrl, '— stopping wrapper promotion');
-                                return false;
-                            }
-                            sessionStorage.setItem(loopKey, String(promoCount + 1));
-                        } catch (e) { /* sessionStorage unavailable */ }
 
                         navigationSwitchTriggered = true;
                         window.stop();
@@ -2165,6 +2164,7 @@ window.addEventListener('DOMContentLoaded', () => {
                 };
                 var sharedSettings = null;
                 var runtimeConfig = readInitialRuntimeConfig();
+                var audioSyncScheduled = false;
                 var renderControlInstalled = false;
 
                 function cloneSettings(settings) {
@@ -2244,6 +2244,82 @@ window.addEventListener('DOMContentLoaded', () => {
                     } else {
                         notify();
                     }
+                }
+
+                function getSoundManager() {
+                    return window.Grobal && window.Grobal.SoundManager ? window.Grobal.SoundManager : null;
+                }
+
+                function applyAudioSettings() {
+                    var soundManager = getSoundManager();
+                    if (!soundManager) return false;
+
+                    var audio = sharedSettings && sharedSettings.audio ? sharedSettings.audio : {};
+                    var muteAll = !!audio.muteAll;
+                    var muteBgm = !!audio.muteBgm;
+                    var muteSe = !!audio.muteSe;
+
+                    try {
+                        if (typeof soundManager.setBgmMute === 'function') {
+                            soundManager.setBgmMute(muteAll ? true : muteBgm);
+                        }
+                        if (typeof soundManager.setSeMute === 'function') {
+                            soundManager.setSeMute(muteAll ? true : muteSe);
+                        }
+                        if (typeof soundManager.setBattleSeMute === 'function') {
+                            soundManager.setBattleSeMute(muteAll ? true : muteSe);
+                        }
+                        if (typeof soundManager.setVoiceMute === 'function') {
+                            soundManager.setVoiceMute(muteAll ? true : muteSe);
+                        }
+                    } catch (e) {}
+
+                    return true;
+                }
+
+                function scheduleAudioSync() {
+                    if (audioSyncScheduled) return;
+                    audioSyncScheduled = true;
+                    requestAnimationFrame(function() {
+                        audioSyncScheduled = false;
+                        if (!applyAudioSettings()) {
+                            scheduleAudioSync();
+                        }
+                    });
+                }
+
+                function updateAudioFromCommand(command, payload) {
+                    var enabled = null;
+                    if (typeof payload === 'boolean') {
+                        enabled = payload;
+                    } else if (payload && typeof payload.enabled === 'boolean') {
+                        enabled = payload.enabled;
+                    } else if (payload && typeof payload.value === 'boolean') {
+                        enabled = payload.value;
+                    }
+
+                    if (enabled == null) return;
+                    if (!sharedSettings) {
+                        refreshSharedSettings(readInitialSettings());
+                    }
+
+                    if (!sharedSettings.audio) {
+                        sharedSettings.audio = { muteAll: false, muteBgm: false, muteSe: false };
+                    }
+
+                    if (command === 'setMuteAll') {
+                        sharedSettings.audio.muteAll = !!enabled;
+                        sharedSettings.audio.muteBgm = !!enabled;
+                        sharedSettings.audio.muteSe = !!enabled;
+                    } else if (command === 'setMuteBgm') {
+                        sharedSettings.audio.muteBgm = !!enabled;
+                        sharedSettings.audio.muteAll = sharedSettings.audio.muteBgm && sharedSettings.audio.muteSe;
+                    } else if (command === 'setMuteSe') {
+                        sharedSettings.audio.muteSe = !!enabled;
+                        sharedSettings.audio.muteAll = sharedSettings.audio.muteBgm && sharedSettings.audio.muteSe;
+                    }
+
+                    applyAudioSettings();
                 }
 
                 var gameCanvas = null;
@@ -3076,6 +3152,11 @@ window.addEventListener('DOMContentLoaded', () => {
                 }
 
                 function handleRendererCommand(command, payload) {
+                    if (command === 'setMuteAll' || command === 'setMuteBgm' || command === 'setMuteSe') {
+                        updateAudioFromCommand(command, payload);
+                        return;
+                    }
+
                     if (command === 'setBlackout') {
                         var enabled = resolveBooleanPayload(payload);
                         blackoutEnabled = enabled == null ? !blackoutEnabled : enabled;
@@ -3113,6 +3194,7 @@ window.addEventListener('DOMContentLoaded', () => {
                         if (!event) return;
                         if (event.type === 'settings-updated' && event.payload) {
                             refreshSharedSettings(event.payload);
+                            scheduleAudioSync();
                             return;
                         }
                         if (event.type !== 'renderer-command') return;
@@ -3296,6 +3378,7 @@ window.addEventListener('DOMContentLoaded', () => {
                 installExpeditionRequestHook();
                 startExpeditionNotifier();
                 refreshSharedSettings(readInitialSettings());
+                scheduleAudioSync();
                 installMainEventBridge();
                 loadCustomScripts();
 
