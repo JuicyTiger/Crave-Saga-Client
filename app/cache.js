@@ -489,4 +489,5 @@ module.exports = {
   dispose: () => {
     server?.close();
   },
+  getResourceCacheFolder: () => resourceCacheFolder,
 };

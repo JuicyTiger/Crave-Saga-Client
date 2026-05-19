@@ -6,6 +6,7 @@ let mainEventListenerId = 0;
 let cachedSettings = null;
 let cachedProviderState = null;
 let _cacheFolderPromise = null;
+const _pbReadyListeners = [];
 
 function cloneSettings(settings) {
     try {
@@ -84,8 +85,12 @@ function dispatchMainEvent(data, options = {}) {
         // Ignore dispatch errors in restricted contexts
     }
 
+    if (data?.type === 'csc-pb-ready') {
+        for (const fn of _pbReadyListeners) { try { fn(); } catch (e) {} }
+    }
+
     if (options.forwardToChildren === false) return;
-    if (data?.type !== 'renderer-command') return;
+    if (data?.type !== 'renderer-command' && data?.type !== 'csc-pb-ready') return;
     let childFrames = null;
     try {
         childFrames = window.frames;
@@ -195,7 +200,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getMobileNotifySettings: () => ipcRenderer.invoke('get-mobile-notify-settings').catch(() => null),
     setMobileNotifySettings: (data) => ipcRenderer.invoke('set-mobile-notify-settings', data).catch(() => null),
     getProxySettings: () => ipcRenderer.invoke('get-proxy-settings').catch(() => null),
-    setProxySettings: (settings) => ipcRenderer.invoke('set-proxy-settings', settings).catch(() => false)
+    setProxySettings: (settings) => ipcRenderer.invoke('set-proxy-settings', settings).catch(() => false),
+    onPbReady: (fn) => { if (typeof fn === 'function') _pbReadyListeners.push(fn); }
 });
 
 // ====== Phase 2 & 3: Iframe Stripping + Canvas Injection + Cache Polyfill ======
@@ -315,6 +321,10 @@ window.addEventListener('DOMContentLoaded', () => {
                     }
                 }
 
+                function shouldPreserveShellStripSibling(node) {
+                    return !!(node && node.classList && node.classList.contains('cocosEditBox'));
+                }
+
                 function hideSiblingsAlongAncestorChain(node, shouldApply) {
                     if (!node) return;
                     if (shouldApply === false) return;
@@ -324,8 +334,7 @@ window.addEventListener('DOMContentLoaded', () => {
                         if (!parent) break;
                         for (var i = 0; i < parent.children.length; i++) {
                             var sibling = parent.children[i];
-                            if (sibling !== current) {
-                                if (sibling.tagName === 'INPUT' || sibling.tagName === 'TEXTAREA' || sibling.getAttribute('contenteditable') === 'true') continue;
+                            if (sibling !== current && !shouldPreserveShellStripSibling(sibling)) {
                                 sibling.style.display = 'none';
                             }
                         }
@@ -480,6 +489,7 @@ window.addEventListener('DOMContentLoaded', () => {
                 function sanitizeGame() {
                     var keepAttr = 'data-csc-shellstrip-subframe-game-keep';
                     var styleId = 'csc-shellstrip-subframe-game-mask-style';
+                    var activeEditBoxPatch = null;
 
                     function ensureStyle() {
                         if (document.getElementById(styleId)) return;
@@ -487,9 +497,134 @@ window.addEventListener('DOMContentLoaded', () => {
                         style.id = styleId;
                         style.textContent =
                             'html, body { margin: 0 !important; overflow: hidden !important; background: #000 !important; height: 100% !important; }' +
-                            'body *:not([' + keepAttr + ']):not(input):not(textarea):not([contenteditable="true"]) { display: none !important; }' +
-                            '#GameDiv[' + keepAttr + '], #GameCanvas[' + keepAttr + '], canvas[' + keepAttr + '] { display: block !important; position: fixed !important; top: 0 !important; left: 0 !important; width: 100vw !important; height: 100vh !important; max-width: 100vw !important; max-height: 100vh !important; margin: 0 !important; border: 0 !important; z-index: 2147483647 !important; }';
+                            'body *:not([' + keepAttr + ']):not(.cocosEditBox) { display: none !important; }' +
+                            '#GameDiv[' + keepAttr + '] { display: block !important; position: fixed !important; top: 0 !important; left: 0 !important; width: 100vw !important; height: 100vh !important; max-width: 100vw !important; max-height: 100vh !important; margin: 0 !important; border: 0 !important; z-index: 2147483647 !important; }' +
+                            '#GameCanvas[' + keepAttr + '], canvas[' + keepAttr + '] { display: block !important; position: fixed !important; top: 0 !important; left: 0 !important; width: 100vw !important; height: 100vh !important; max-width: 100vw !important; max-height: 100vh !important; margin: 0 !important; border: 0 !important; }';
                         (document.head || document.documentElement).appendChild(style);
+                    }
+
+                    function isCocosEditBoxInput(node) {
+                        return !!(node && node.classList && node.classList.contains('cocosEditBox'));
+                    }
+
+                    function collectCocosEditBoxes() {
+                        var boxes = [];
+                        try {
+                            if (!window.cc || !cc.director || typeof cc.director.getScene !== 'function') return boxes;
+                            var scene = cc.director.getScene();
+                            function walk(node) {
+                                if (!node) return;
+                                var components = node._components || [];
+                                for (var i = 0; i < components.length; i++) {
+                                    var comp = components[i];
+                                    var name = (comp && (comp.__classname__ || (comp.constructor && comp.constructor.name))) || '';
+                                    if (/EditBox/i.test(name) || (cc.EditBox && comp instanceof cc.EditBox)) {
+                                        boxes.push(comp);
+                                    }
+                                }
+                                var children = node.children || [];
+                                for (var j = 0; j < children.length; j++) {
+                                    walk(children[j]);
+                                }
+                            }
+                            walk(scene);
+                        } catch (e) {}
+                        return boxes;
+                    }
+
+                    function pickCocosEditBoxForInput(input) {
+                        var boxes = collectCocosEditBoxes();
+                        if (boxes.length === 0) return null;
+                        var inputValue = input && typeof input.value === 'string' ? input.value : '';
+                        for (var i = 0; i < boxes.length; i++) {
+                            if (boxes[i] && boxes[i].string === inputValue) return boxes[i];
+                        }
+                        for (var j = 0; j < boxes.length; j++) {
+                            var labelNode = boxes[j] && boxes[j]._N$textLabel && boxes[j]._N$textLabel.node;
+                            if (labelNode && labelNode.active) return boxes[j];
+                        }
+                        return boxes[0] || null;
+                    }
+
+                    function restoreCocosEditBoxPatch() {
+                        if (!activeEditBoxPatch) return;
+                        var patch = activeEditBoxPatch;
+                        activeEditBoxPatch = null;
+                        if (patch.input) {
+                            if (patch.inputZIndex == null) {
+                                patch.input.style.removeProperty('z-index');
+                            } else {
+                                patch.input.style.zIndex = patch.inputZIndex;
+                            }
+                            if (patch.inputPosition == null) {
+                                patch.input.style.removeProperty('position');
+                            } else {
+                                patch.input.style.position = patch.inputPosition;
+                            }
+                        }
+                        if (patch.labelNode) {
+                            var inputValue = patch.input && typeof patch.input.value === 'string' ? patch.input.value : '';
+                            patch.labelNode.active = inputValue.length > 0 ? true : patch.labelActive;
+                            patch.labelNode.opacity = patch.labelOpacity;
+                        }
+                    }
+
+                    function applyCocosEditBoxPatch(input) {
+                        if (!isCocosEditBoxInput(input)) return;
+                        var box = pickCocosEditBoxForInput(input);
+                        var labelNode = box && box._N$textLabel && box._N$textLabel.node;
+                        if (activeEditBoxPatch && activeEditBoxPatch.input !== input) {
+                            restoreCocosEditBoxPatch();
+                        }
+                        if (!activeEditBoxPatch) {
+                            activeEditBoxPatch = {
+                                input: input,
+                                inputZIndex: input.style.zIndex || null,
+                                inputPosition: input.style.position || null,
+                                labelNode: labelNode || null,
+                                labelActive: labelNode ? labelNode.active : null,
+                                labelOpacity: labelNode ? labelNode.opacity : null
+                            };
+                        } else if (!activeEditBoxPatch.labelNode && labelNode) {
+                            activeEditBoxPatch.labelNode = labelNode;
+                            activeEditBoxPatch.labelActive = labelNode.active;
+                            activeEditBoxPatch.labelOpacity = labelNode.opacity;
+                        }
+                        input.style.display = 'block';
+                        input.style.position = 'absolute';
+                        input.style.zIndex = '2147483647';
+                        if (labelNode) {
+                            labelNode.active = false;
+                        }
+                    }
+
+                    function installCocosEditBoxVisibilityBridge() {
+                        if (window.__cscCocosEditBoxVisibilityBridgeInstalled) return;
+                        window.__cscCocosEditBoxVisibilityBridgeInstalled = true;
+
+                        document.addEventListener('focusin', function(ev) {
+                            if (isCocosEditBoxInput(ev && ev.target)) {
+                                applyCocosEditBoxPatch(ev.target);
+                            }
+                        }, true);
+
+                        document.addEventListener('input', function(ev) {
+                            if (isCocosEditBoxInput(ev && ev.target)) {
+                                applyCocosEditBoxPatch(ev.target);
+                            }
+                        }, true);
+
+                        document.addEventListener('focusout', function(ev) {
+                            if (!isCocosEditBoxInput(ev && ev.target)) return;
+                            setTimeout(restoreCocosEditBoxPatch, 0);
+                        }, true);
+
+                        document.addEventListener('keydown', function(ev) {
+                            if (!isCocosEditBoxInput(document.activeElement)) return;
+                            if (ev && (ev.key === 'Enter' || ev.key === 'Escape')) {
+                                setTimeout(restoreCocosEditBoxPatch, 0);
+                            }
+                        }, true);
                     }
 
                     function tick() {
@@ -515,6 +650,7 @@ window.addEventListener('DOMContentLoaded', () => {
                         setTimeout(tick, 250);
                     }
 
+                    installCocosEditBoxVisibilityBridge();
                     tick();
                 }
 
@@ -1221,6 +1357,37 @@ window.addEventListener('DOMContentLoaded', () => {
                     muteSe: false
                 };
                 var subframeAudioApplyScheduled = false;
+                var subframeAudioApplyAttempts = 0;
+                var subframeAudioApplyStableSince = 0;
+
+                var SUBFRAME_AUDIO_APPLY_STARTUP_ATTEMPTS = 3600;
+                var SUBFRAME_AUDIO_APPLY_COMMAND_ATTEMPTS = 180;
+                var SUBFRAME_AUDIO_APPLY_STABLE_MS = 5000;
+
+                function normalizeSubframeAudioState(settings) {
+                    var source = settings && typeof settings === 'object' ? settings : {};
+                    var audio = source.audio && typeof source.audio === 'object' ? source.audio : {};
+                    return {
+                        muteAll: !!audio.muteAll,
+                        muteBgm: !!audio.muteBgm,
+                        muteSe: !!audio.muteSe
+                    };
+                }
+
+                function readSubframeAudioState() {
+                    if (window.electronAPI && typeof window.electronAPI.refreshSettings === 'function') {
+                        return normalizeSubframeAudioState(window.electronAPI.refreshSettings());
+                    }
+                    if (window.electronAPI && typeof window.electronAPI.getSettings === 'function') {
+                        return normalizeSubframeAudioState(window.electronAPI.getSettings());
+                    }
+                    return normalizeSubframeAudioState(null);
+                }
+
+                function syncSubframeAudioState(settings) {
+                    subframeAudioState = normalizeSubframeAudioState(settings);
+                    scheduleSubframeAudioApply(SUBFRAME_AUDIO_APPLY_STARTUP_ATTEMPTS, true);
+                }
 
                 function applySubframeAudioStateNow() {
                     var soundManager = getSubframeSoundManager();
@@ -1250,18 +1417,59 @@ window.addEventListener('DOMContentLoaded', () => {
                     return true;
                 }
 
-                function scheduleSubframeAudioApply(maxAttempts) {
+                function isSubframeSoundManagerInitialized() {
+                    var soundManager = getSubframeSoundManager();
+                    if (!soundManager) return false;
+                    return soundManager.curBgmId !== -1 ||
+                        soundManager.curVoiceId !== -1 ||
+                        soundManager.playingBgm != null ||
+                        soundManager.bgmVolume !== 1 ||
+                        soundManager.seVolume !== 1 ||
+                        soundManager.battleSeVolume !== 1 ||
+                        soundManager.voiceVolume !== 1;
+                }
+
+                function isSubframeAudioStateApplied() {
+                    var soundManager = getSubframeSoundManager();
+                    if (!soundManager) return false;
+                    var muteAll = !!subframeAudioState.muteAll;
+                    var muteBgm = !!subframeAudioState.muteBgm;
+                    var muteSe = !!subframeAudioState.muteSe;
+                    return !!soundManager.bgmMute === (muteAll ? true : muteBgm) &&
+                        !!soundManager.seMute === (muteAll ? true : muteSe) &&
+                        !!soundManager.battleSeMute === (muteAll ? true : muteSe) &&
+                        !!soundManager.voiceMute === (muteAll ? true : muteSe);
+                }
+
+                function scheduleSubframeAudioApply(maxAttempts, waitForInitialized) {
+                    var attempts = typeof maxAttempts === 'number' ? maxAttempts : 120;
+                    subframeAudioApplyAttempts = Math.max(subframeAudioApplyAttempts, attempts);
+                    subframeAudioApplyStableSince = 0;
                     if (subframeAudioApplyScheduled) return;
                     subframeAudioApplyScheduled = true;
 
-                    var attempts = typeof maxAttempts === 'number' ? maxAttempts : 120;
                     function tick() {
-                        if (applySubframeAudioStateNow()) {
+                        if (waitForInitialized) {
+                            subframeAudioState = readSubframeAudioState();
+                        }
+                        var applied = applySubframeAudioStateNow();
+                        var initialized = isSubframeSoundManagerInitialized();
+                        var stateApplied = isSubframeAudioStateApplied();
+                        if (applied && initialized && stateApplied) {
+                            if (!subframeAudioApplyStableSince) subframeAudioApplyStableSince = Date.now();
+                        } else {
+                            subframeAudioApplyStableSince = 0;
+                        }
+                        var canStop = applied && (
+                            !waitForInitialized ||
+                            (initialized && stateApplied && Date.now() - subframeAudioApplyStableSince >= SUBFRAME_AUDIO_APPLY_STABLE_MS)
+                        );
+                        if (canStop) {
                             subframeAudioApplyScheduled = false;
                             return;
                         }
-                        attempts -= 1;
-                        if (attempts <= 0) {
+                        subframeAudioApplyAttempts -= 1;
+                        if (subframeAudioApplyAttempts <= 0) {
                             subframeAudioApplyScheduled = false;
                             console.warn('[CSC] (Subframe) Audio state apply timed out');
                             return;
@@ -1288,7 +1496,7 @@ window.addEventListener('DOMContentLoaded', () => {
                         subframeAudioState.muteAll = subframeAudioState.muteBgm && subframeAudioState.muteSe;
                     }
 
-                    scheduleSubframeAudioApply(180);
+                    scheduleSubframeAudioApply(SUBFRAME_AUDIO_APPLY_COMMAND_ATTEMPTS);
                 }
 
                 function getSubframeGameCanvas() {
@@ -1617,14 +1825,21 @@ window.addEventListener('DOMContentLoaded', () => {
                     if (!window.electronAPI || typeof window.electronAPI.onMainEvent !== 'function') return;
 
                     window.electronAPI.onMainEvent(function(event) {
-                        if (!event || event.type !== 'renderer-command') return;
-                        var command = event.payload && event.payload.command;
-                        var payload = event.payload && event.payload.payload;
-                        if (!command) return;
+                        if (!event) return;
 
                         // DMM/FANZA wrappers may contain multiple non-game subframes.
                         // Ignore game-control commands outside the resolved game frame to avoid useless retries/timeouts.
                         if (!isGamePage) return;
+
+                        if (event.type === 'settings-updated' && event.payload) {
+                            syncSubframeAudioState(event.payload);
+                            return;
+                        }
+
+                        if (event.type !== 'renderer-command') return;
+                        var command = event.payload && event.payload.command;
+                        var payload = event.payload && event.payload.payload;
+                        if (!command) return;
 
                         if (command === 'downloadResources') {
                             startSubframeResourceDownload();
@@ -1632,6 +1847,7 @@ window.addEventListener('DOMContentLoaded', () => {
                         }
 
                         if (command === 'setMuteAll' || command === 'setMuteBgm' || command === 'setMuteSe') {
+                            if (!getSubframeSoundManager()) return;
                             applySubframeMuteCommand(command, payload);
                             return;
                         }
@@ -1659,6 +1875,10 @@ window.addEventListener('DOMContentLoaded', () => {
                             screenshotToClipboardSubframe();
                         }
                     });
+
+                    if (isGamePage) {
+                        syncSubframeAudioState(readSubframeAudioState());
+                    }
 
                     window.__cscSubframeMainEventBridgeInstalled = true;
                 }
@@ -1839,6 +2059,721 @@ window.addEventListener('DOMContentLoaded', () => {
 
                     installSubframeRightClickLongPress();
                     installSubframeCacheLoader();
+                    // Expedition monitoring for DMM/Fanza subframe (game iframe) context.
+                    // The main frame script's expedition hook runs only when isGamePage is true
+                    // on the main window, but for DMM/Fanza the game lives in a subframe —
+                    // the main window is the wrapper page (isGamePage=false there).
+                    // All XHR calls to /gg/ are made from this iframe, so we install the
+                    // monitoring here to enable AP/RP display and expedition notifications.
+                    (function() {
+                        if (window.__cscExpeditionHookInstalled) return;
+
+                        var expeditionState = {
+                            referenceTimeDiffMs: null,
+                            expeditions: {},
+                            expeditionGroups: [],
+                            eventExpeditions: {},
+                            eventExpeditionGroups: []
+                        };
+                        var masterData = {};
+                        var userData = {
+                            userLevel: 0,
+                            staminaMax: 0,
+                            battlePointMax: 0,
+                            staminaValue: 0,
+                            staminaRecoverInterval: 180,
+                            staminaRecoveryDateMs: null,
+                            staminaRemainSec: 0,
+                            staminaBonus: 0,
+                            staminaIsFull: false,
+                            battlePointValue: 0,
+                            battlePointRecoverInterval: 600,
+                            battlePointRecoveryDateMs: null,
+                            battlePointRemainSec: 0,
+                            battlePointBonus: 0,
+                            battlePointIsFull: false,
+                            estimatedstamina: 0,
+                            estimatedstaminaRemainSec: 0,
+                            estimatedBattlePoint: 0,
+                            estimatedBattlePointRemainSec: 0,
+                            hasData: false,
+                            hasMasterData: false
+                        };
+                        var raidState = {
+                            isInRaid: false,
+                            hasScore: false,
+                            hp: 0,
+                            score: 0,
+                            currentScore: 0
+                        };
+                        var sharedSettings = null;
+                        var lastPublishedStatus = '';
+
+                        function normalizeSettings(settings) {
+                            var source = settings && typeof settings === 'object' ? settings : {};
+                            var notifications = source.notifications && typeof source.notifications === 'object' ? source.notifications : {};
+                            var audio = source.audio && typeof source.audio === 'object' ? source.audio : {};
+                            return {
+                                notifications: {
+                                    battleEnd: notifications.battleEnd !== false,
+                                    raidDeath: notifications.raidDeath !== false,
+                                    expedition: notifications.expedition !== false,
+                                    eventExpedition: notifications.eventExpedition !== false,
+                                    stamina: notifications.stamina !== false,
+                                    battlepoint: notifications.battlepoint !== false
+                                },
+                                audio: {
+                                    muteAll: !!audio.muteAll,
+                                    muteBgm: !!audio.muteBgm,
+                                    muteSe: !!audio.muteSe
+                                }
+                            };
+                        }
+
+                        function readInitialSettings() {
+                            if (window.electronAPI && typeof window.electronAPI.getSettings === 'function') {
+                                return normalizeSettings(window.electronAPI.getSettings());
+                            }
+                            return normalizeSettings(null);
+                        }
+
+                        function refreshSharedSettings(settings) {
+                            sharedSettings = normalizeSettings(settings);
+                            return sharedSettings;
+                        }
+
+                        function isNotificationEnabled(type) {
+                            if (!type) return true;
+                            var notifications = sharedSettings && sharedSettings.notifications ? sharedSettings.notifications : {};
+                            if (Object.prototype.hasOwnProperty.call(notifications, type)) {
+                                return !!notifications[type];
+                            }
+                            return true;
+                        }
+
+                        function sendGameNotification(type, title, body, delay) {
+                            if (!isNotificationEnabled(type)) return;
+                            if (!window.electronAPI || typeof window.electronAPI.showNotification !== 'function') return;
+
+                            var notify = function() {
+                                var notifyResult = window.electronAPI.showNotification(title, body, type);
+                                if (notifyResult && typeof notifyResult.then === 'function') {
+                                    notifyResult.then(function(result) {
+                                        console.log('[CSC][NotificationDebug] ' + type + ' result=' + JSON.stringify(result));
+                                    });
+                                }
+                            };
+
+                            if (typeof delay === 'number' && delay > 0) {
+                                setTimeout(notify, delay);
+                            } else {
+                                notify();
+                            }
+                        }
+
+                        function publishTrayStatus(statusEntries) {
+                            if (!window.electronAPI || typeof window.electronAPI.updateTrayStatus !== 'function') return;
+                            var statusString = statusEntries && statusEntries.length > 0 ? statusEntries.join(' | ') : '';
+                            if (statusString === lastPublishedStatus) return;
+                            lastPublishedStatus = statusString;
+                            window.electronAPI.updateTrayStatus({ status: statusString });
+                        }
+
+                        function parseGameDateToMs(dateStr) {
+                            if (!dateStr || typeof dateStr !== 'string' || dateStr.length < 14) return null;
+                            var y = parseInt(dateStr.slice(0, 4), 10);
+                            var m = parseInt(dateStr.slice(4, 6), 10);
+                            var d = parseInt(dateStr.slice(6, 8), 10);
+                            var hh = parseInt(dateStr.slice(8, 10), 10);
+                            var mm = parseInt(dateStr.slice(10, 12), 10);
+                            var ss = parseInt(dateStr.slice(12, 14), 10);
+                            if (isNaN(y) || isNaN(m) || isNaN(d) || isNaN(hh) || isNaN(mm) || isNaN(ss)) return null;
+                            return new Date(y, m - 1, d, hh, mm, ss).getTime();
+                        }
+
+                        function decodeResponsePayload(xhr) {
+                            try {
+                                var content = xhr && xhr.response;
+                                if (typeof content === 'string' && content.length > 0) {
+                                    return JSON.parse(content);
+                                }
+                                if (content && typeof content === 'object') {
+                                    if (window.electronAPI && typeof window.electronAPI.decodeMsgpack === 'function') {
+                                        var decoded = window.electronAPI.decodeMsgpack(content);
+                                        if (decoded) return decoded;
+                                    }
+                                    return content;
+                                }
+                                if (typeof xhr.responseText === 'string' && xhr.responseText.length > 0) {
+                                    return JSON.parse(xhr.responseText);
+                                }
+                            } catch (e) {}
+                            return null;
+                        }
+
+                        function systemDateUpdate(systemDate) {
+                            var gameMs = parseGameDateToMs(systemDate);
+                            if (gameMs == null) return;
+                            expeditionState.referenceTimeDiffMs = gameMs - Date.now();
+                        }
+
+                        function updateTime(data) {
+                            try {
+                                var systemDate = data && data.systemDate;
+                                systemDateUpdate(systemDate);
+                            } catch (e) {}
+                        }
+
+                        function processUserMasterData() {
+                            try {
+                                var userMaster = masterData && masterData.user;
+                                var userMain = userMaster && userMaster.UserMain;
+                                if (!userMain) return;
+                                var levelData = userMain[userData.userLevel - 1];
+                                if (!levelData) return;
+                                userData.staminaMax = levelData.maxStamina || 0;
+                                userData.battlePointMax = levelData.maxBattlePoint || 0;
+                                userData.staminaIsFull = userData.staminaValue >= userData.staminaMax;
+                                userData.battlePointIsFull = userData.battlePointValue >= userData.battlePointMax;
+                                userData.hasMasterData = true;
+                            } catch (e) {}
+                        }
+
+                        function updateUser(data) {
+                            try {
+                                var user = data && data.user;
+                                if (!user) return;
+                                systemDateUpdate(user.systemDate);
+                                userData.userLevel = user.level || 0;
+                                userData.staminaValue = user.staminaValue || 0;
+                                userData.staminaBonus = user.staminaBonus || 0;
+                                userData.staminaRecoveryDateMs = parseGameDateToMs(user.staminaRecoveryDate);
+                                userData.staminaRemainSec = user.staminaRemainSec || 0;
+                                userData.battlePointValue = user.battlePointValue || 0;
+                                userData.battlePointBonus = user.battlePointBonus || 0;
+                                userData.battlePointRecoveryDateMs = parseGameDateToMs(user.battlePointRecoveryDate);
+                                userData.battlePointRemainSec = user.battlePointRemainSec || 0;
+                                userData.hasData = true;
+                                processUserMasterData();
+                            } catch (e) {}
+                        }
+
+                        function processMasterData(pathname, data) {
+                            try {
+                                var matched = pathname && pathname.match(/^\\/gg\\/(.+)\\/getMasterData\\d*$/);
+                                var masterDataType = matched && matched[1];
+                                if (!masterDataType) return;
+                                if (!masterData[masterDataType]) {
+                                    masterData[masterDataType] = data;
+                                } else {
+                                    var existing = masterData[masterDataType];
+                                    for (var key in data) {
+                                        if (Array.isArray(data[key]) && Array.isArray(existing[key])) {
+                                            existing[key] = existing[key].concat(data[key]);
+                                        } else {
+                                            existing[key] = data[key];
+                                        }
+                                    }
+                                }
+                                processUserMasterData();
+                            } catch (e) {}
+                        }
+
+                        // DMM/Fanza master data: zlib-compressed protobuf .bin files
+                        // served from gg-resource CDN (not the /gg/ API). Decoded
+                        // preferentially via the game's own pbjs decoders, captured
+                        // as window.__cscPb by a CDP conditional breakpoint on
+                        // index.js. UserMain has a hand-written fallback decoder so
+                        // the expedition monitor keeps working even if __cscPb
+                        // capture fails (e.g. game version changes the pattern).
+                        function decodeUserMainBin(bytes) {
+                            // Hand-written protobuf reader for UserMain_List (field 1
+                            // repeated UserMain). UserMain fields used by the monitor:
+                            // 2=userLevel, 5=maxStamina, 6=maxBattlePoint.
+                            var pos = 0, list = [], textDecoder = new TextDecoder();
+                            function readVarint() {
+                                var result = 0, shift = 0, b;
+                                do { b = bytes[pos++]; result |= (b & 0x7f) << shift; shift += 7; } while (b & 0x80);
+                                return result >>> 0;
+                            }
+                            function skipWire(wt) {
+                                if (wt === 0) readVarint();
+                                else if (wt === 2) { var l = readVarint(); pos += l; }
+                                else if (wt === 1) pos += 8;
+                                else if (wt === 5) pos += 4;
+                            }
+                            function decodeEntry(end) {
+                                var entry = {};
+                                while (pos < end) {
+                                    var tag = readVarint(), f = tag >>> 3, wt = tag & 7;
+                                    if (wt === 0) {
+                                        var v = readVarint();
+                                        if (f === 2) entry.userLevel = v;
+                                        else if (f === 3) entry.totalExp = v;
+                                        else if (f === 4) entry.nextLevelExp = v;
+                                        else if (f === 5) entry.maxStamina = v;
+                                        else if (f === 6) entry.maxBattlePoint = v;
+                                        else if (f === 7) entry.maxFriendCount = v;
+                                        else if (f === 8) entry.maxApplyCount = v;
+                                        else if (f === 9) entry.maxApproveCount = v;
+                                    } else if (wt === 2) {
+                                        var len = readVarint();
+                                        if (f === 10) entry.fromDate = textDecoder.decode(bytes.subarray(pos, pos + len));
+                                        pos += len;
+                                    } else { skipWire(wt); }
+                                }
+                                return entry;
+                            }
+                            while (pos < bytes.length) {
+                                var tag = readVarint(), f = tag >>> 3, wt = tag & 7;
+                                if (f === 1 && wt === 2) { var len = readVarint(); list.push(decodeEntry(pos + len)); }
+                                else skipWire(wt);
+                            }
+                            return list;
+                        }
+                        function tryDecodeBin(tableName, bytes) {
+                            var pb = window.__cscPb;
+                            if (pb) {
+                                var listType = pb[tableName + '_List'];
+                                var msgType = pb[tableName];
+                                try {
+                                    if (listType && typeof listType.decode === 'function') {
+                                        var decoded = listType.decode(bytes);
+                                        storeBinMasterData(tableName, (decoded && decoded.list) || []);
+                                        return true;
+                                    } else if (msgType && typeof msgType.decode === 'function') {
+                                        storeBinMasterData(tableName, [msgType.decode(bytes)]);
+                                        return true;
+                                    } else {
+                                        console.warn('[CSC-CDP] no decoder for ' + tableName);
+                                        return true; // pb is ready but table unknown; drop
+                                    }
+                                } catch (e) {
+                                    console.warn('[CSC-CDP] decode failed for ' + tableName + ':', e && e.message || e);
+                                    return true;
+                                }
+                            }
+                            // Fallback: hand-written decoder for UserMain so the expedition
+                            // monitor keeps working even when __cscPb capture fails.
+                            if (tableName === 'UserMain') {
+                                try { storeBinMasterData('UserMain', decodeUserMainBin(bytes)); return true; }
+                                catch (e) { console.warn('[CSC-CDP] fallback UserMain decode failed:', e && e.message || e); }
+                            }
+                            return false;
+                        }
+                        function storeBinMasterData(tableName, list) {
+                            masterData[tableName] = list;
+                            if (tableName === 'UserMain') {
+                                if (!masterData.user) masterData.user = {};
+                                masterData.user.UserMain = list;
+                                processUserMasterData();
+                            }
+                        }
+                        // Mass-fetch all master data tables once both manifest
+                        // (versions.json from gg-resource CDN — the index of every
+                        // .bin file with its current hash) and __cscPb (the protobuf
+                        // namespace, captured by the CDP breakpoint in
+                        // electron-main.js) are available. UserMain is prioritized so
+                        // the expedition monitor lights up in the first batch.
+                        var _masterDataManifest = null;
+                        var _manifestFetchInflight = false;
+                        var _massFetchStarted = false;
+                        var _massFetchUrlBase = null;
+                        function detectBinUrlBase() {
+                            if (_massFetchUrlBase) return _massFetchUrlBase;
+                            // Match any gg-resource URL (e.g., resource.txt) to derive
+                            // host + version prefix. cocos2d's loader bypasses the
+                            // iframe performance API for .bin fetches, so we can't
+                            // rely on seeing a /bin/ URL here.
+                            var perf = (typeof performance !== 'undefined' && performance.getEntriesByType)
+                                ? performance.getEntriesByType('resource') : [];
+                            for (var pi = 0; pi < perf.length; pi++) {
+                                var pu = perf[pi].name || '';
+                                var pm = pu.match(/^(https:\\/\\/gg-resource\\.crave-saga\\.net\\/[^\\/]+)\\//);
+                                if (pm) { _massFetchUrlBase = pm[1] + '/bin/'; return _massFetchUrlBase; }
+                            }
+                            return null;
+                        }
+                        async function tryFetchManifest() {
+                            if (_masterDataManifest || _manifestFetchInflight) return;
+                            var base = detectBinUrlBase();
+                            if (!base) return; // game hasn't loaded any .bin yet
+                            _manifestFetchInflight = true;
+                            try {
+                                var r = await fetch(base + 'versions.json');
+                                if (!r.ok) { console.warn('[CSC] versions.json fetch failed: ' + r.status); return; }
+                                var m = await r.json();
+                                if (!m || typeof m !== 'object' || Array.isArray(m)) return;
+                                var sample = Object.keys(m).slice(0, 3);
+                                if (!sample.every(function(k) { return typeof m[k] === 'string' && /^[a-f0-9]{32}$/.test(m[k]); })) {
+                                    console.warn('[CSC] versions.json shape unexpected, sample=', sample);
+                                    return;
+                                }
+                                _masterDataManifest = m;
+                                console.log('[CSC] manifest loaded: ' + Object.keys(m).length + ' tables');
+                                maybeKickoffMassFetch();
+                            } catch (e) {
+                                console.warn('[CSC] manifest fetch error:', e && e.message || e);
+                            } finally {
+                                _manifestFetchInflight = false;
+                            }
+                        }
+                        function maybeKickoffMassFetch() {
+                            if (_massFetchStarted) return;
+                            if (!_masterDataManifest || !window.__cscPb) return;
+                            _massFetchStarted = true;
+                            clearInterval(_binFetchInterval);
+                            massFetchAllTables();
+                        }
+                        async function massFetchAllTables() {
+                            try {
+                                var entries = Object.entries(_masterDataManifest).filter(function(e) {
+                                    return e[1] && e[1] !== 'd41d8cd98f00b204e9800998ecf8427e'; // skip empty md5
+                                });
+                                entries.sort(function(a, b) {
+                                    if (a[0] === 'UserMain') return -1;
+                                    if (b[0] === 'UserMain') return 1;
+                                    return 0;
+                                });
+                                console.log('[CSC] mass-fetch start: ' + entries.length + ' tables');
+                                var concurrency = 10;
+                                var failed = 0;
+                                for (var i = 0; i < entries.length; i += concurrency) {
+                                    var batch = entries.slice(i, i + concurrency);
+                                    var results = await Promise.all(batch.map(function(e) { return fetchAndDecodeBin(e[0], e[1]); }));
+                                    for (var ri = 0; ri < results.length; ri++) {
+                                        if (!results[ri]) {
+                                            failed++;
+                                            if (batch[ri][0] === 'UserMain') console.warn('[CSC] UserMain fetch/decode failed — expedition monitor may not function');
+                                        }
+                                    }
+                                }
+                                console.log('[CSC] mass-fetch complete: stored=' + Object.keys(masterData).length + ' failed=' + failed);
+                            } catch (e) {
+                                console.warn('[CSC] mass-fetch error:', e && e.message || e);
+                            }
+                        }
+                        async function fetchAndDecodeBin(tableName, hash) {
+                            try {
+                                var r = await fetch(_massFetchUrlBase + tableName + '.bin?v=' + hash);
+                                if (!r.ok) return false;
+                                var stream = r.body.pipeThrough(new DecompressionStream('deflate'));
+                                var buf = await new Response(stream).arrayBuffer();
+                                return tryDecodeBin(tableName, new Uint8Array(buf));
+                            } catch (e) {
+                                console.warn('[CSC] mass-fetch failed for ' + tableName + ':', e && e.message || e);
+                                return false;
+                            }
+                        }
+                        var _binFetchInterval = setInterval(function() {
+                            tryFetchManifest();
+                            maybeKickoffMassFetch();
+                        }, 500);
+
+                        if (window.electronAPI && typeof window.electronAPI.onPbReady === 'function') {
+                            window.electronAPI.onPbReady(function() { maybeKickoffMassFetch(); });
+                        }
+
+                        function gameDateNowMs() {
+                            if (expeditionState.referenceTimeDiffMs == null) return null;
+                            return Date.now() + expeditionState.referenceTimeDiffMs;
+                        }
+
+                        function groupExpeditions() {
+                            expeditionState.expeditionGroups.splice(0, expeditionState.expeditionGroups.length);
+                            var ids = Object.keys(expeditionState.expeditions);
+                            for (var i = 0; i < ids.length; i++) {
+                                var id = ids[i];
+                                var endMs = expeditionState.expeditions[id];
+                                var existingGroup = null;
+                                for (var j = 0; j < expeditionState.expeditionGroups.length; j++) {
+                                    var group = expeditionState.expeditionGroups[j];
+                                    if (Math.abs(group.endTime - endMs) < 60000) { existingGroup = group; break; }
+                                }
+                                if (existingGroup) {
+                                    existingGroup.ids.push(id);
+                                    existingGroup.endTime = Math.max(existingGroup.endTime, endMs);
+                                } else {
+                                    expeditionState.expeditionGroups.push({ endTime: endMs, ids: [id] });
+                                }
+                            }
+                        }
+
+                        function groupEventExpeditions() {
+                            expeditionState.eventExpeditionGroups.splice(0, expeditionState.eventExpeditionGroups.length);
+                            var ids = Object.keys(expeditionState.eventExpeditions);
+                            for (var i = 0; i < ids.length; i++) {
+                                var id = ids[i];
+                                var endMs = expeditionState.eventExpeditions[id];
+                                var existingGroup = null;
+                                for (var j = 0; j < expeditionState.eventExpeditionGroups.length; j++) {
+                                    var group = expeditionState.eventExpeditionGroups[j];
+                                    if (Math.abs(group.endTime - endMs) < 60000) { existingGroup = group; break; }
+                                }
+                                if (existingGroup) {
+                                    existingGroup.ids.push(id);
+                                    existingGroup.endTime = Math.max(existingGroup.endTime, endMs);
+                                } else {
+                                    expeditionState.eventExpeditionGroups.push({ endTime: endMs, ids: [id] });
+                                }
+                            }
+                        }
+
+                        function updateExpeditions(data) {
+                            try {
+                                var gameNow = gameDateNowMs();
+                                if (gameNow == null) return 0;
+                                var expeditionData = data && data.expeditions;
+                                if (!expeditionData) return 0;
+                                for (var i = 0; i < expeditionData.length; i++) {
+                                    var expedition = expeditionData[i];
+                                    if (!expedition || !expedition.endDate || !expedition.startDate) continue;
+                                    var endMs = parseGameDateToMs(expedition.endDate);
+                                    if (endMs == null) continue;
+                                    var id = expedition.slotId;
+                                    if (id == null) continue;
+                                    id = String(id);
+                                    if (endMs < gameNow || expedition.receiveDate) {
+                                        delete expeditionState.expeditions[id];
+                                        continue;
+                                    }
+                                    expeditionState.expeditions[id] = endMs;
+                                    groupExpeditions();
+                                }
+                                return expeditionData.length || 0;
+                            } catch (e) { return 0; }
+                        }
+
+                        function updateEventExpeditions(data) {
+                            try {
+                                var gameNow = gameDateNowMs();
+                                if (gameNow == null) return 0;
+                                var expeditionData = data && data.eventExpeditions;
+                                if (!expeditionData) return 0;
+                                for (var i = 0; i < expeditionData.length; i++) {
+                                    var expedition = expeditionData[i];
+                                    if (!expedition || !expedition.endDate || !expedition.startDate) continue;
+                                    var endMs = parseGameDateToMs(expedition.endDate);
+                                    if (endMs == null) continue;
+                                    var id = expedition.slotId;
+                                    if (id == null) continue;
+                                    id = String(id);
+                                    if (endMs < gameNow || expedition.receiveDate) {
+                                        delete expeditionState.eventExpeditions[id];
+                                        continue;
+                                    }
+                                    expeditionState.eventExpeditions[id] = endMs;
+                                    groupEventExpeditions();
+                                }
+                                return expeditionData.length || 0;
+                            } catch (e) { return 0; }
+                        }
+
+                        function updateRaidBattle(data) {
+                            try {
+                                if (data && data.raidStatus) {
+                                    raidState.hp = data.raidStatus.currentHp;
+                                    raidState.isInRaid = true;
+                                    return;
+                                }
+                                if (data && data.currentHp) {
+                                    raidState.hp = data.currentHp;
+                                    raidState.currentScore = data.score;
+                                    raidState.isInRaid = true;
+                                } else {
+                                    raidState.isInRaid = false;
+                                    raidState.hasScore = false;
+                                    raidState.hp = 0;
+                                    raidState.score = 0;
+                                    raidState.currentScore = 0;
+                                }
+                            } catch (e) {}
+                        }
+
+                        function endRaidBattle() {
+                            raidState.isInRaid = false;
+                            raidState.hasScore = false;
+                            raidState.hp = 0;
+                            raidState.score = 0;
+                            raidState.currentScore = 0;
+                        }
+
+                        function processApiResponse(pathname, data) {
+                            if (!pathname || !data) return;
+                            if (/\\/getMasterData\\d*$/.test(pathname)) {
+                                processMasterData(pathname, data);
+                            } else if (/\\/user\\/getSystemDate$/.test(pathname)) {
+                                updateTime(data);
+                            } else if (/\\/raid\\/updateBattle$/.test(pathname)) {
+                                updateRaidBattle(data);
+                            } else if (/\\/raid\\/joinBattle$/.test(pathname) || /\\/raid\\/resumeBattle$/.test(pathname) || /\\/raid\\/appearBattle$/.test(pathname)) {
+                                updateRaidBattle(data);
+                            } else if (/endBattle$/.test(pathname)) {
+                                endRaidBattle();
+                                sendGameNotification('battleEnd', 'Crave Saga', 'Battle has ended', 3500);
+                            }
+                            updateUser(data);
+                            var expeditionCount = updateExpeditions(data);
+                            var eventExpeditionCount = updateEventExpeditions(data);
+                            console.log('[CSC][ExpeditionDebug] pathname=' + pathname + ' expeditionCount=' + expeditionCount + ' eventExpeditionCount=' + eventExpeditionCount);
+                        }
+
+                        function installExpeditionRequestHook() {
+                            if (window.__cscExpeditionHookInstalled) return;
+                            window.__cscExpeditionHookInstalled = true;
+                            var originalOpen = XMLHttpRequest.prototype.open;
+                            XMLHttpRequest.prototype.open = function() {
+                                this.addEventListener('readystatechange', function() {
+                                    if (this.readyState !== 4) return;
+                                    try {
+                                        var rawUrl = this.responseURL;
+                                        if (!rawUrl) return;
+                                        var url = new URL(rawUrl, window.location.origin);
+                                        document.dispatchEvent(new CustomEvent('responseReceived', { detail: { req: this } }));
+                                        if (!url.pathname || url.pathname.indexOf('/gg/') !== 0) return;
+                                        var data = decodeResponsePayload(this);
+                                        processApiResponse(url.pathname, data);
+                                    } catch (e) {}
+                                }, false);
+                                return originalOpen.apply(this, arguments);
+                            };
+                        }
+
+                        function startExpeditionNotifier() {
+                            if (window.__cscExpeditionTickerStarted) return;
+                            window.__cscExpeditionTickerStarted = true;
+                            setInterval(function() {
+                                var statusEntries = [];
+                                var now = gameDateNowMs();
+                                if (now == null) return;
+
+                                for (var i = 0; i < expeditionState.expeditionGroups.length; i++) {
+                                    var group = expeditionState.expeditionGroups[i];
+                                    if (now > group.endTime) {
+                                        var ids = group.ids.map(function(id) { return '#' + id; });
+                                        var message = ids.length > 1
+                                            ? 'Expeditions ' + ids.join(',') + ' has finished'
+                                            : 'Expedition ' + ids[0] + ' has finished';
+
+                                        console.log('[CSC][ExpeditionDebug] notify=' + message);
+                                        sendGameNotification('expedition', 'Crave Saga', message);
+
+                                        for (var j = 0; j < group.ids.length; j++) {
+                                            delete expeditionState.expeditions[group.ids[j]];
+                                        }
+                                        groupExpeditions();
+                                        i = -1;
+                                    }
+                                }
+
+                                for (var i = 0; i < expeditionState.eventExpeditionGroups.length; i++) {
+                                    var group = expeditionState.eventExpeditionGroups[i];
+                                    if (now > group.endTime) {
+                                        var ids = group.ids.map(function(id) { return '#' + id; });
+                                        var message = ids.length > 1
+                                            ? 'Event Expeditions ' + ids.join(',') + ' has finished'
+                                            : 'Event Expedition ' + ids[0] + ' has finished';
+
+                                        console.log('[CSC][ExpeditionDebug] notify=' + message);
+                                        sendGameNotification('eventExpedition', 'Crave Saga', message);
+                                        for (var j = 0; j < group.ids.length; j++) {
+                                            delete expeditionState.eventExpeditions[group.ids[j]];
+                                        }
+                                        groupEventExpeditions();
+                                        i = -1;
+                                    }
+                                }
+
+                                if (userData.hasData && userData.hasMasterData) {
+                                    var isstaminaFull = userData.staminaIsFull;
+                                    var isBattlePointFull = userData.battlePointIsFull;
+                                    var staminaStartTimeMs = userData.staminaRecoveryDateMs != null
+                                        ? userData.staminaRecoveryDateMs - userData.staminaRemainSec * 1000
+                                        : null;
+                                    var staminaInterval = userData.staminaRecoverInterval || 180;
+                                    if (staminaStartTimeMs != null && staminaInterval > 0) {
+                                        var staminaDiffSec = (now - staminaStartTimeMs) / 1000;
+                                        var staminaRecoverCount = Math.floor(staminaDiffSec / staminaInterval);
+                                        userData.estimatedstamina = Math.min(
+                                            userData.staminaMax,
+                                            userData.staminaValue + staminaRecoverCount
+                                        );
+                                        userData.estimatedstaminaRemainSec = Math.ceil(
+                                            staminaInterval - (staminaDiffSec % staminaInterval)
+                                        );
+                                        isstaminaFull = userData.estimatedstamina >= userData.staminaMax;
+                                        if (!userData.staminaIsFull && isstaminaFull) {
+                                            userData.staminaIsFull = true;
+                                            sendGameNotification('stamina', 'Crave Saga', 'AP has fully recovered');
+                                        }
+                                    }
+                                    var staminaString = isstaminaFull
+                                        ? 'AP: ' + (userData.estimatedstamina + userData.staminaBonus) + '/' + userData.staminaMax
+                                        : 'AP: ' + (userData.estimatedstamina + userData.staminaBonus) + '/' + userData.staminaMax + ' (' + userData.estimatedstaminaRemainSec + 's)';
+                                    statusEntries.push(staminaString);
+
+                                    var battlePointStartTimeMs = userData.battlePointRecoveryDateMs != null
+                                        ? userData.battlePointRecoveryDateMs - userData.battlePointRemainSec * 1000
+                                        : null;
+                                    var battlePointInterval = userData.battlePointRecoverInterval || 600;
+                                    if (battlePointStartTimeMs != null && battlePointInterval > 0) {
+                                        var battlePointDiffSec = (now - battlePointStartTimeMs) / 1000;
+                                        var battlePointRecoverCount = Math.floor(battlePointDiffSec / battlePointInterval);
+                                        userData.estimatedBattlePoint = Math.min(
+                                            userData.battlePointMax,
+                                            userData.battlePointValue + battlePointRecoverCount
+                                        );
+                                        userData.estimatedBattlePointRemainSec = Math.ceil(
+                                            battlePointInterval - (battlePointDiffSec % battlePointInterval)
+                                        );
+                                        isBattlePointFull = userData.estimatedBattlePoint >= userData.battlePointMax;
+                                        if (!userData.battlePointIsFull && isBattlePointFull) {
+                                            userData.battlePointIsFull = true;
+                                            sendGameNotification('battlepoint', 'Crave Saga', 'RP has fully recovered');
+                                        }
+                                    }
+                                    var battlePointString = isBattlePointFull
+                                        ? 'RP: ' + (userData.estimatedBattlePoint + userData.battlePointBonus) + '/' + userData.battlePointMax
+                                        : 'RP: ' + (userData.estimatedBattlePoint + userData.battlePointBonus) + '/' + userData.battlePointMax + ' (' + userData.estimatedBattlePointRemainSec + 's)';
+                                    statusEntries.push(battlePointString);
+                                }
+
+                                if (raidState.isInRaid) {
+                                    if (raidState.currentScore != null) raidState.score = raidState.currentScore;
+                                    statusEntries.push('Raid Boss HP: ' + raidState.hp);
+                                    if (raidState.score) statusEntries.push('Raid Damage: ' + raidState.score);
+                                    if (!raidState.hasScore && raidState.currentScore != null) {
+                                        raidState.hasScore = true;
+                                    } else if (raidState.hasScore && raidState.currentScore == null) {
+                                        raidState.hasScore = false;
+                                        sendGameNotification('raidDeath', 'Crave Saga', 'Your team has been defeated in raid battle.');
+                                    }
+                                }
+
+                                publishTrayStatus(statusEntries);
+                            }, 1000);
+                        }
+
+                        refreshSharedSettings(readInitialSettings());
+                        installExpeditionRequestHook();
+                        startExpeditionNotifier();
+
+                        // Expose masterData so CraveAuto can read it via __cscBridge traversal
+                        try {
+                            if (!window.__cscBridge || typeof window.__cscBridge !== 'object') window.__cscBridge = {};
+                            if (!window.__cscBridge.engine || typeof window.__cscBridge.engine !== 'object') window.__cscBridge.engine = {};
+                            window.__cscBridge.engine.masterData = masterData;
+                        } catch (e) {}
+
+                        // Keep notification settings in sync with main process
+                        if (window.electronAPI && typeof window.electronAPI.onMainEvent === 'function') {
+                            window.electronAPI.onMainEvent(function(event) {
+                                if (event && event.type === 'settings-updated' && event.payload) {
+                                    refreshSharedSettings(event.payload);
+                                }
+                            });
+                        }
+                    })();
                     installSubframeCustomScriptsLoader();
                     // 浮动按钮仅在 injected.bundle.js 存在时创建
                     if (window.electronAPI && typeof window.electronAPI.hasAutomationBundle === 'function') {
@@ -2634,10 +3569,21 @@ window.addEventListener('DOMContentLoaded', () => {
 
                 function processMasterData(pathname, data) {
                     try {
-                        var matched = pathname && pathname.match(/^\\/gg\\/(.+)\\/getMasterData$/);
+                        var matched = pathname && pathname.match(/^\\/gg\\/(.+)\\/getMasterData\\d*$/);
                         var masterDataType = matched && matched[1];
                         if (!masterDataType) return;
-                        masterData[masterDataType] = data;
+                        if (!masterData[masterDataType]) {
+                            masterData[masterDataType] = data;
+                        } else {
+                            var existing = masterData[masterDataType];
+                            for (var key in data) {
+                                if (Array.isArray(data[key]) && Array.isArray(existing[key])) {
+                                    existing[key] = existing[key].concat(data[key]);
+                                } else {
+                                    existing[key] = data[key];
+                                }
+                            }
+                        }
                         processUserMasterData();
                     } catch (e) {}
                 }
@@ -3210,7 +4156,7 @@ window.addEventListener('DOMContentLoaded', () => {
                 function processApiResponse(pathname, data) {
                     if (!pathname || !data) return;
 
-                    if (/\\/getMasterData$/.test(pathname)) {
+                    if (/\\/getMasterData\\d*$/.test(pathname)) {
                         processMasterData(pathname, data);
                     } else if (/\\/user\\/getSystemDate$/.test(pathname)) {
                         updateTime(data);

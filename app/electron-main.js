@@ -355,49 +355,6 @@ function syncAudioStateFromSettings() {
     gameCommandState.muteSe = !!audio.muteSe;
 }
 
-/**
- * 通过 webFrameMain.executeJavaScript() 直接在游戏子框架的页面世界中
- * 操作 Grobal.SoundManager 来同步音频静音状态。
- *
- * 解决的问题：fanza/dmm 的游戏运行在子框架中，页面加载过程中可能产生
- * 多个 VM 上下文（内部导航/iframe 重建）。通过 emitRendererCommand 经
- * preload 事件桥中转的命令可能投递到已失效的旧 VM 上下文，被静默丢弃。
- * 而 executeJavaScript 直接在当前活跃的页面世界中执行，始终命中正确上下文。
- */
-function syncAudioStateToGameFrames() {
-    if (!mainWindow || mainWindow.isDestroyed()) return;
-
-    const muteAll = !!gameCommandState.muteAll;
-    const muteBgm = !!(muteAll || gameCommandState.muteBgm);
-    const muteSe = !!(muteAll || gameCommandState.muteSe);
-    if (!muteAll && !muteBgm && !muteSe) return;
-
-    const jsCode = `(function(){
-        var attempts=0;
-        var timer=setInterval(function(){
-            var sm=window.Grobal&&window.Grobal.SoundManager;
-            if(sm){
-                clearInterval(timer);
-                try{
-                    if(typeof sm.setBgmMute==='function')sm.setBgmMute(${muteBgm});
-                    if(typeof sm.setSeMute==='function')sm.setSeMute(${muteSe});
-                    if(typeof sm.setBattleSeMute==='function')sm.setBattleSeMute(${muteSe});
-                    if(typeof sm.setVoiceMute==='function')sm.setVoiceMute(${muteSe});
-                }catch(e){}
-                return;
-            }
-            if(++attempts>60){clearInterval(timer);}
-        },500);
-    })()`;
-
-    try {
-        const frames = mainWindow.webContents.mainFrame.framesInSubtree;
-        for (const frame of frames) {
-            frame.executeJavaScript(jsCode).catch(() => {});
-        }
-    } catch (_e) { /* framesInSubtree 不可用时静默忽略 */ }
-}
-
 function broadcastSettingsSnapshot() {
     emitMainEvent('settings-updated', getSettingsSnapshot());
     updateTrayDisplay();
@@ -3130,8 +3087,6 @@ async function runCommandDispatcher(command, payload) {
             }
         );
         const sent = emitRendererCommand('setMuteAll', { enabled });
-        // 精准注入：直接在游戏子框架页面世界中操作 SoundManager
-        syncAudioStateToGameFrames();
         return { ok: sent, command, enabled };
     };
 
@@ -3467,11 +3422,6 @@ async function runCommandDispatcher(command, payload) {
                     if (gameCommandState.frameRate !== 0) {
                         emitRendererCommand('setFrameRate', { fps: gameCommandState.frameRate });
                     }
-                    // 音频静音：通过 executeJavaScript 直接在游戏子框架页面世界中操作
-                    // Grobal.SoundManager，绕过多子框架 VM 上下文隔离和 SoundManager
-                    // 初始化时序问题（emitRendererCommand 经 preload 事件桥中转时，
-                    // 可能投递到已失效的 VM 上下文导致静默丢弃）。
-                    syncAudioStateToGameFrames();
                 }
 
                 return {
@@ -3966,6 +3916,9 @@ ipcMain.on('set-tray-status', (event, payload) => {
     if (typeof nextStatus === 'string' && nextStatus.trim()) {
         globalState.status = nextStatus;
         updateTrayDisplay();
+        if (hasMainWindow()) {
+            try { mainWindow.setTitle('Crave Saga | ' + nextStatus); } catch (e) {}
+        }
     }
 });
 
