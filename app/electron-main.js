@@ -2940,6 +2940,137 @@ app.whenReady().then(async () => {
     }
 
     createWindow();
+    (function setupMasterDataAutoCapture() {
+        // DMM/Fanza ships master data as zlib-compressed protobuf .bin files,
+        // decodable only with the game's own pbjs decoders (closure-scoped in
+        // index.js's IIFE, not on window). We auto-attach to OOPIFs, enable
+        // Debugger on non-worker sub-targets, locate `new c.db.UserMain` in the
+        // bundle, and set a one-shot breakpoint there. When it hits, we read
+        // c.db from the call frame's closure via evaluateOnCallFrame and assign
+        // it to window.__cscPb in the iframe, then remove the breakpoint. The
+        // pause is microseconds and invisible to the user; from then on the
+        // iframe can decode any of the 430 master data tables on demand.
+        if (!mainWindow || !mainWindow.webContents) { console.warn('[CSC-CDP] no mainWindow, abort'); return; }
+        const dbg = mainWindow.webContents.debugger;
+        try {
+            dbg.attach('1.3');
+            console.log('[CSC-CDP] debugger attached OK');
+        } catch (e) {
+            console.warn('[CSC-CDP] attach FAILED:', e && e.message || e); return;
+        }
+
+        dbg.sendCommand('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true })
+            .catch((e) => console.warn('[CSC-CDP] Target.setAutoAttach FAILED:', e && e.message || e));
+
+        const _armedScripts = new Set(); // scriptId+sessionId already inspected
+        const _armedBreakpoints = new Map(); // bpId -> { sessionId, varName, url }
+        let _pbCaptured = false;
+
+        dbg.on('message', async (event, method, params, sessionId) => {
+            // Skip Debugger.enable on worker-type targets: it floods Electron with
+            // "ipcNative object missing" errors from contexts that lack preload's
+            // electronAPI binding. Iframe / page targets are safe.
+            if (method === 'Target.attachedToTarget') {
+                const sid = params && params.sessionId;
+                const targetInfo = (params && params.targetInfo) || {};
+                const targetUrl = targetInfo.url || '';
+                const targetType = targetInfo.type || '';
+                const enableDebugger = targetType !== 'service_worker' && targetType !== 'shared_worker' && targetType !== 'worker';
+                if (sid) {
+                    const enables = [];
+                    if (enableDebugger) enables.push(dbg.sendCommand('Debugger.enable', {}, sid).catch(() => {}));
+                    Promise.allSettled(enables).finally(() => {
+                        dbg.sendCommand('Runtime.runIfWaitingForDebugger', {}, sid)
+                            .catch((e) => console.warn('[CSC-CDP] resume FAILED session=' + sid + ':', e && e.message || e));
+                    });
+                }
+            }
+
+            // Scan the game's main JS bundle for the c.db.UserMain reference and arm
+            // a breakpoint there. The breakpoint pauses the iframe on first hit so we
+            // can read `c` from the call frame's closure scope (it's not on window),
+            // assign c.db to window.__cscPb, then immediately remove the breakpoint
+            // and resume. The pause is microseconds-long and invisible to the user.
+            if (method === 'Debugger.scriptParsed') {
+                const url = (params && params.url) || '';
+                if (!/\/index\.js(\?|$)/.test(url)) return;
+                const armKey = (sessionId || '') + ':' + params.scriptId;
+                if (_armedScripts.has(armKey)) return;
+                _armedScripts.add(armKey);
+                try {
+                    const src = await dbg.sendCommand('Debugger.getScriptSource', { scriptId: params.scriptId }, sessionId);
+                    const source = src && src.scriptSource;
+                    if (!source) return;
+                    const match = source.match(/\bnew\s+(\w+)\.db\.UserMain\b/);
+                    if (!match) return; // not the bundle that hosts pbjs schemas
+                    const offset = match.index;
+                    let line = 0, col = 0;
+                    for (let i = 0; i < offset; i++) {
+                        if (source.charCodeAt(i) === 10) { line++; col = 0; } else col++;
+                    }
+                    const varName = match[1];
+                    const result = await dbg.sendCommand('Debugger.setBreakpoint', {
+                        location: { scriptId: params.scriptId, lineNumber: line, columnNumber: col },
+                        condition: 'true'
+                    }, sessionId);
+                    if (result && result.breakpointId) {
+                        _armedBreakpoints.set(result.breakpointId, { sessionId: sessionId || null, varName, url });
+                        console.log('[CSC-CDP] __cscPb breakpoint armed at ' + line + ':' + col + ' var=' + varName + ' bpId=' + result.breakpointId);
+                    }
+                } catch (e) {
+                    console.warn('[CSC-CDP] __cscPb setup failed:', e && e.message || e);
+                }
+            }
+
+            // Breakpoint hit — capture c.db from the call frame's closure, then
+            // tear down the breakpoint so subsequent decode calls run unimpeded.
+            if (method === 'Debugger.paused') {
+                const hitIds = (params && params.hitBreakpoints) || [];
+                let bpId = null, info = null;
+                for (const id of hitIds) {
+                    if (_armedBreakpoints.has(id)) { bpId = id; info = _armedBreakpoints.get(id); break; }
+                }
+                if (!info) {
+                    // Not ours — resume so the game isn't stuck.
+                    dbg.sendCommand('Debugger.resume', {}, sessionId).catch(() => {});
+                    return;
+                }
+                const callFrames = (params && params.callFrames) || [];
+                try {
+                    if (callFrames.length > 0) {
+                        const r = await dbg.sendCommand('Debugger.evaluateOnCallFrame', {
+                            callFrameId: callFrames[0].callFrameId,
+                            expression: 'window.__cscPb = ' + info.varName + '.db; Object.keys(window.__cscPb).length'
+                        }, sessionId);
+                        const count = r && r.result && r.result.value;
+                        if (typeof count === 'number') {
+                            _pbCaptured = true;
+                            console.log('[CSC-CDP] __cscPb captured: ' + count + ' message types');
+                            emitMainEvent('csc-pb-ready');
+                        } else {
+                            console.warn('[CSC-CDP] __cscPb capture returned unexpected:', JSON.stringify(r && r.result));
+                        }
+                    }
+                } catch (e) {
+                    console.warn('[CSC-CDP] evaluateOnCallFrame failed:', e && e.message || e);
+                }
+                _armedBreakpoints.delete(bpId);
+                try { await dbg.sendCommand('Debugger.removeBreakpoint', { breakpointId: bpId }, sessionId); } catch (e) {}
+                try { await dbg.sendCommand('Debugger.resume', {}, sessionId); } catch (e) {}
+                try { dbg.detach(); } catch (e) {}
+            }
+
+        });
+
+        mainWindow.webContents.on('devtools-opened', () => {
+            if (!_pbCaptured) {
+                console.log('[CSC-CDP] devtools opened before __cscPb capture; keeping debugger attached');
+                return;
+            }
+            console.log('[CSC-CDP] devtools opened after __cscPb capture, detaching debugger');
+            try { dbg.detach(); } catch (e) {}
+        });
+    })();
     if (runtimeFlags.tray) {
         createTray();
     }

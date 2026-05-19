@@ -2465,21 +2465,8 @@ window.addEventListener('DOMContentLoaded', () => {
                                 return false;
                             }
                         }
-                        var _userMainBinFetched = false;
-                        function tryFetchUserMainBinOnly() {
-                            if (_userMainBinFetched || _massFetchStarted) return;
-                            if (!_masterDataManifest) return;
-                            if (masterData.user && masterData.user.UserMain) return;
-                            var hash = _masterDataManifest['UserMain'];
-                            if (!hash) return;
-                            var base = detectBinUrlBase();
-                            if (!base) return;
-                            _userMainBinFetched = true;
-                            fetchAndDecodeBin('UserMain', hash);
-                        }
                         var _binFetchInterval = setInterval(function() {
                             tryFetchManifest();
-                            tryFetchUserMainBinOnly();
                             maybeKickoffMassFetch();
                         }, 500);
 
