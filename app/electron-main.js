@@ -6,6 +6,7 @@ const net = require('net');
 const os = require('os');
 const path = require('path');
 const cache = require('./cache'); // Import the caching proxy
+const { getFontOverrideSettings, saveFontOverrideSettings } = require('./font-overrides');
 const ini = require('./ini');
 const { decode: decodeMsgpack } = require('@msgpack/msgpack');
 const { createSettingsStore, DEFAULT_SETTINGS } = require('./settings-store');
@@ -4082,15 +4083,50 @@ ipcMain.handle('set-proxy-settings', async (event, settings) => {
     return true;
 });
 
+ipcMain.handle('get-font-override-settings', () => {
+    return getFontOverrideSettings();
+});
+
+ipcMain.handle('set-font-override-settings', (event, settings) => {
+    try {
+        return saveFontOverrideSettings(settings);
+    } catch (error) {
+        const message = error?.message || String(error);
+        console.warn(`[FontOverride] 保存字体覆盖设置失败: ${message}`);
+        return { error: message };
+    }
+});
+
+ipcMain.handle('select-font-override-file', async (event) => {
+    const owner = BrowserWindow.fromWebContents(event.sender) || mainWindow || undefined;
+    const result = await dialog.showOpenDialog(owner, {
+        title: '选择替换字体',
+        properties: ['openFile'],
+        filters: [
+            { name: '字体文件', extensions: ['ttf', 'otf', 'woff', 'woff2'] },
+            { name: '所有文件', extensions: ['*'] },
+        ],
+    });
+    if (result.canceled || !result.filePaths || !result.filePaths[0]) return null;
+    return result.filePaths[0];
+});
+
 // Receive target host information from the game renderer and store it in global context
 ipcMain.handle('get-cache-folder', () => {
     return cache.getResourceCacheFolder();
+});
+
+ipcMain.handle('get-font-override-css', () => {
+    return cache.getFontOverrideCss();
 });
 
 ipcMain.on('set-cache-config', (event, data) => {
     if (data.resourceHost) global.resourceHost = data.resourceHost;
     if (data.clientHost) global.clientHost = data.clientHost;
     if (data.clientVersion) global.clientVersion = data.clientVersion;
+    if (Object.prototype.hasOwnProperty.call(data, 'fontOverrideVersion')) {
+        global.fontOverrideVersion = data.fontOverrideVersion || null;
+    }
     console.log(`[Cache Config] Res: ${global.resourceHost}, Client: ${global.clientHost}, Ver: ${global.clientVersion}`);
 });
 

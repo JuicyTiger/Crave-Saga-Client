@@ -162,6 +162,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     hasAutomationBundle: () => ipcRenderer.invoke('has-automation-bundle').catch(() => false),
     updateTrayStatus: (data) => ipcRenderer.send('set-tray-status', data),
     getProxyPort: () => ipcRenderer.invoke('get-proxy-port'),
+    getFontOverrideCss: () => ipcRenderer.invoke('get-font-override-css').catch(() => ''),
     setCacheConfig: (data) => ipcRenderer.send('set-cache-config', data),
     getCacheFolder: () => {
         if (!_cacheFolderPromise) {
@@ -201,6 +202,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
     setMobileNotifySettings: (data) => ipcRenderer.invoke('set-mobile-notify-settings', data).catch(() => null),
     getProxySettings: () => ipcRenderer.invoke('get-proxy-settings').catch(() => null),
     setProxySettings: (settings) => ipcRenderer.invoke('set-proxy-settings', settings).catch(() => false),
+    getFontOverrideSettings: () => ipcRenderer.invoke('get-font-override-settings').catch(() => null),
+    setFontOverrideSettings: (settings) => ipcRenderer.invoke('set-font-override-settings', settings).catch(() => false),
+    selectFontOverrideFile: () => ipcRenderer.invoke('select-font-override-file').catch(() => null),
     onPbReady: (fn) => { if (typeof fn === 'function') _pbReadyListeners.push(fn); }
 });
 
@@ -280,6 +284,8 @@ window.addEventListener('DOMContentLoaded', () => {
         console.log('[CSC] EROLABS login verification page detected; skipping page-world injection.');
         return;
     }
+
+    const fontOverrideVersionLiteral = JSON.stringify(providerState?.lang || null);
 
     const injectedRegexHelpersSource = `
                 function checkUrl(url, patterns) {
@@ -437,6 +443,7 @@ window.addEventListener('DOMContentLoaded', () => {
             subframeScript.textContent = `
             (function() {
                 var providerRegexContract = ${JSON.stringify(providerRegexContract)};
+                var fontOverrideVersion = ${fontOverrideVersionLiteral};
                 ${injectedRegexHelpersSource}
                 ${injectedMaskHelpersSource}
                 ${injectedWrapperHelpersSource}
@@ -691,7 +698,67 @@ window.addEventListener('DOMContentLoaded', () => {
                         var scene = cc.director.getScene();
                         if (!scene) return false;
 
+                        function getNodeName(node) {
+                            return String(node && (node.name || node._name || '') || '');
+                        }
+
+                        function getNodeSortZ(node) {
+                            var z = Number(node && (node.zIndex != null ? node.zIndex : node._localZOrder));
+                            return isFinite(z) ? z : 0;
+                        }
+
+                        function getNodeSortOrder(node) {
+                            var order = Number(node && node._orderOfArrival);
+                            return isFinite(order) ? order : 0;
+                        }
+
+                        function getNodeChain(node) {
+                            var chain = [];
+                            var current = node;
+                            var guard = 0;
+                            while (current && guard < 64) {
+                                chain.unshift(current);
+                                current = current.parent || current._parent || null;
+                                guard += 1;
+                            }
+                            return chain;
+                        }
+
+                        function compareSceneOrder(a, b) {
+                            if (!a || !b || a === b) return 0;
+                            var aChain = getNodeChain(a);
+                            var bChain = getNodeChain(b);
+                            var length = Math.min(aChain.length, bChain.length);
+                            var index = 0;
+                            while (index < length && aChain[index] === bChain[index]) {
+                                index += 1;
+                            }
+                            var aNode = aChain[index] || a;
+                            var bNode = bChain[index] || b;
+                            var zDiff = getNodeSortZ(aNode) - getNodeSortZ(bNode);
+                            if (zDiff !== 0) return zDiff;
+                            return getNodeSortOrder(aNode) - getNodeSortOrder(bNode);
+                        }
+
+                        function isModalBlockerNode(node) {
+                            if (!node || !node._activeInHierarchy) return false;
+                            var name = getNodeName(node).toLowerCase();
+                            return name === 'modal' || name === 'modallayer';
+                        }
+
+                        function getBlockingModal(selectedCandidate, modalBlockers) {
+                            if (!selectedCandidate || !Array.isArray(modalBlockers)) return null;
+                            for (var i = 0; i < modalBlockers.length; i++) {
+                                var blocker = modalBlockers[i];
+                                if (compareSceneOrder(blocker, selectedCandidate.node) >= 0) {
+                                    return blocker;
+                                }
+                            }
+                            return null;
+                        }
+
                         var candidates = [];
+                        var modalBlockers = [];
 
                         function gatherCandidates(node) {
                             if (!node || !node._activeInHierarchy) return;
@@ -708,6 +775,9 @@ window.addEventListener('DOMContentLoaded', () => {
                                 bbox = node.getBoundingBoxToWorld();
                             } catch (e) { return; }
                             if (!bbox || !bbox.contains(mousePosition)) return;
+                            if (isModalBlockerNode(node)) {
+                                modalBlockers.push(node);
+                            }
 
                             if (!Array.isArray(node._components)) return;
                             for (var j = 0; j < node._components.length; j++) {
@@ -716,6 +786,7 @@ window.addEventListener('DOMContentLoaded', () => {
                                 var handler = getLongPressHandler(component);
                                 if (typeof handler !== 'function') continue;
                                 candidates.push({
+                                    node: node,
                                     component: component,
                                     handler: handler,
                                     area: bbox.width * bbox.height,
@@ -736,6 +807,8 @@ window.addEventListener('DOMContentLoaded', () => {
                         });
 
                         try {
+                            var blockingModal = getBlockingModal(candidates[0], modalBlockers);
+                            if (blockingModal) return false;
                             candidates[0].handler.apply(candidates[0].component);
                             return true;
                         } catch (e) {}
@@ -913,6 +986,90 @@ window.addEventListener('DOMContentLoaded', () => {
                     if (window.__cscSubframeCacheLoaderInstalled) return;
                     window.__cscSubframeCacheLoaderInstalled = true;
 
+                    function injectFontOverrideCss() {
+                        if (
+                            !window.electronAPI ||
+                            typeof window.electronAPI.getFontOverrideCss !== 'function'
+                        ) return;
+                        if (window.__cscFontOverrideCssInstalling) return;
+                        window.__cscFontOverrideCssInstalling = true;
+
+                        function disableCompetingFontFaces() {
+                            var styles = document.querySelectorAll ? document.querySelectorAll('style') : [];
+                            for (var i = 0; i < styles.length; i++) {
+                                var styleNode = styles[i];
+                                if (!styleNode || styleNode.id === 'csc-font-override-css') continue;
+                                var text = styleNode.textContent || '';
+                                if (/@font-face/i.test(text) && /(?:ResourceHanRounded(?:TW|CN)|TTF-NPRodin|UDKakugo_LargePr6N)/.test(text)) {
+                                    styleNode.disabled = true;
+                                }
+                            }
+                        }
+
+                        function refreshFontOverrideLabels() {
+                            if (!window.cc || !cc.director || typeof cc.director.getScene !== 'function' || !cc.Label) return;
+                            var now = Date.now();
+                            if (window.__cscFontOverrideLabelRefreshAt && now - window.__cscFontOverrideLabelRefreshAt < 1000) return;
+                            window.__cscFontOverrideLabelRefreshAt = now;
+
+                            function walk(node) {
+                                if (!node) return;
+                                var label = node.getComponent && node.getComponent(cc.Label);
+                                if (label) {
+                                    var font = label.font || label._font;
+                                    var fontName = (font && (font._name || font.name || font._native)) || label.fontFamily || label._fontFamily || '';
+                                    if (/(?:ResourceHanRounded(?:TW|CN)|TTF-NPRodin|UDKakugo_LargePr6N)/.test(fontName)) {
+                                        if (typeof label._forceUpdateRenderData === 'function') label._forceUpdateRenderData();
+                                        if (typeof label.setVertsDirty === 'function') label.setVertsDirty();
+                                        if (typeof label.markForUpdateRenderData === 'function') label.markForUpdateRenderData();
+                                    }
+                                }
+                                var children = node.children || [];
+                                for (var i = 0; i < children.length; i++) walk(children[i]);
+                            }
+
+                            walk(cc.director.getScene());
+                        }
+
+                        window.electronAPI.getFontOverrideCss().then(function(css) {
+                            if (!css) return;
+                            var target = document.head || document.documentElement;
+                            if (!target) return;
+
+                            function ensureFontOverrideCss() {
+                                disableCompetingFontFaces();
+                                var style = document.getElementById ? document.getElementById('csc-font-override-css') : null;
+                                if (!style) {
+                                    style = document.createElement('style');
+                                    style.id = 'csc-font-override-css';
+                                    style.type = 'text/css';
+                                    style.textContent = css;
+                                }
+                                if (style.parentNode !== target || target.lastChild !== style) {
+                                    target.appendChild(style);
+                                }
+                                refreshFontOverrideLabels();
+                            }
+
+                            ensureFontOverrideCss();
+                            if (!window.__cscFontOverrideCssObserver && typeof MutationObserver === 'function') {
+                                window.__cscFontOverrideCssObserver = new MutationObserver(function() {
+                                    setTimeout(ensureFontOverrideCss, 0);
+                                });
+                                window.__cscFontOverrideCssObserver.observe(target, { childList: true });
+                            }
+                            if (!window.__cscFontOverrideCssTimer) {
+                                window.__cscFontOverrideCssTimer = setInterval(ensureFontOverrideCss, 1000);
+                            }
+                            if (!window.__cscFontOverrideCssInjected) {
+                                window.__cscFontOverrideCssInjected = true;
+                                console.log('[CSC] 已注入字体覆盖 CSS');
+                            }
+                        }).catch(function() {}).finally(function() {
+                            window.__cscFontOverrideCssInstalling = false;
+                        });
+                    }
+
                     function prepareSubframeCacheLoader() {
                         if (
                             !window.electronAPI ||
@@ -953,7 +1110,11 @@ window.addEventListener('DOMContentLoaded', () => {
                         }
 
                         var clientHost = window.location.protocol + '//' + window.location.host + '/';
-                        window.electronAPI.setCacheConfig({ clientVersion: version, clientHost: clientHost });
+                        window.electronAPI.setCacheConfig({
+                            clientVersion: version,
+                            clientHost: clientHost,
+                            fontOverrideVersion: fontOverrideVersion
+                        });
 
                         var packManager = window.cc.assetManager.packManager;
                         if (!packManager.__cscOriginalLoad && typeof packManager.load === 'function') {
@@ -967,19 +1128,27 @@ window.addEventListener('DOMContentLoaded', () => {
                         var pathname = window.location.pathname || '/';
                         var lastSlashIndex = pathname.lastIndexOf('/');
                         var pathStr = lastSlashIndex >= 0 ? pathname.substring(0, lastSlashIndex + 1) : '/';
+                        var fontOverrideCacheBust = Date.now();
+
+                        function appendFontOverrideCacheBust(url) {
+                            if (typeof url !== 'string' || !/\.ttf(?:[?#]|$)/i.test(url)) return url;
+                            var joiner = url.indexOf('?') >= 0 ? '&' : '?';
+                            return url + joiner + 'csc_font_override=' + fontOverrideCacheBust;
+                        }
 
                         window.electronAPI
                             .getProxyPort()
                             .then(function(port) {
                                 if (!port) return;
                                 var newHost = 'http://localhost:' + port + '/';
+                                injectFontOverrideCss();
 
                                 if (!packManager.__cscCachePatched) {
                                     var originalLoad = packManager.__cscOriginalLoad;
                                     packManager.load = function(t) {
                                         if (!t || !t.url) return originalLoad.apply(this, arguments);
                                         if (t.url.startsWith('http')) return originalLoad.apply(this, arguments);
-                                        t.url = newHost + 'client' + pathStr + t.url;
+                                        t.url = appendFontOverrideCacheBust(newHost + 'client' + pathStr + t.url);
                                         return originalLoad.apply(this, arguments);
                                     };
                                     packManager.__cscCachePatched = true;
@@ -2807,6 +2976,7 @@ window.addEventListener('DOMContentLoaded', () => {
             var skipRender = false;
             var renderGl = null;
             var providerRegexContract = ${JSON.stringify(providerRegexContract)};
+            var fontOverrideVersion = ${fontOverrideVersionLiteral};
             ${injectedRegexHelpersSource}
             ${injectedMaskHelpersSource}
             ${injectedWrapperHelpersSource}
@@ -4495,6 +4665,90 @@ window.addEventListener('DOMContentLoaded', () => {
                 }
 
                 // --- Phase 3: Resource Caching Implementation ---
+                function injectFontOverrideCss() {
+                    if (
+                        !window.electronAPI ||
+                        typeof window.electronAPI.getFontOverrideCss !== 'function'
+                    ) return;
+                    if (window.__cscFontOverrideCssInstalling) return;
+                    window.__cscFontOverrideCssInstalling = true;
+
+                    function disableCompetingFontFaces() {
+                        let styles = document.querySelectorAll ? document.querySelectorAll('style') : [];
+                        for (let i = 0; i < styles.length; i++) {
+                            let styleNode = styles[i];
+                            if (!styleNode || styleNode.id === 'csc-font-override-css') continue;
+                            let text = styleNode.textContent || '';
+                            if (/@font-face/i.test(text) && /(?:ResourceHanRounded(?:TW|CN)|TTF-NPRodin|UDKakugo_LargePr6N)/.test(text)) {
+                                styleNode.disabled = true;
+                            }
+                        }
+                    }
+
+                    function refreshFontOverrideLabels() {
+                        if (!window.cc || !cc.director || typeof cc.director.getScene !== 'function' || !cc.Label) return;
+                        let now = Date.now();
+                        if (window.__cscFontOverrideLabelRefreshAt && now - window.__cscFontOverrideLabelRefreshAt < 1000) return;
+                        window.__cscFontOverrideLabelRefreshAt = now;
+
+                        function walk(node) {
+                            if (!node) return;
+                            let label = node.getComponent && node.getComponent(cc.Label);
+                            if (label) {
+                                let font = label.font || label._font;
+                                let fontName = (font && (font._name || font.name || font._native)) || label.fontFamily || label._fontFamily || '';
+                                if (/(?:ResourceHanRounded(?:TW|CN)|TTF-NPRodin|UDKakugo_LargePr6N)/.test(fontName)) {
+                                    if (typeof label._forceUpdateRenderData === 'function') label._forceUpdateRenderData();
+                                    if (typeof label.setVertsDirty === 'function') label.setVertsDirty();
+                                    if (typeof label.markForUpdateRenderData === 'function') label.markForUpdateRenderData();
+                                }
+                            }
+                            let children = node.children || [];
+                            for (let i = 0; i < children.length; i++) walk(children[i]);
+                        }
+
+                        walk(cc.director.getScene());
+                    }
+
+                    window.electronAPI.getFontOverrideCss().then(css => {
+                        if (!css) return;
+                        let target = document.head || document.documentElement;
+                        if (!target) return;
+
+                        function ensureFontOverrideCss() {
+                            disableCompetingFontFaces();
+                            let style = document.getElementById ? document.getElementById('csc-font-override-css') : null;
+                            if (!style) {
+                                style = document.createElement('style');
+                                style.id = 'csc-font-override-css';
+                                style.type = 'text/css';
+                                style.textContent = css;
+                            }
+                            if (style.parentNode !== target || target.lastChild !== style) {
+                                target.appendChild(style);
+                            }
+                            refreshFontOverrideLabels();
+                        }
+
+                        ensureFontOverrideCss();
+                        if (!window.__cscFontOverrideCssObserver && typeof MutationObserver === 'function') {
+                            window.__cscFontOverrideCssObserver = new MutationObserver(() => {
+                                setTimeout(ensureFontOverrideCss, 0);
+                            });
+                            window.__cscFontOverrideCssObserver.observe(target, { childList: true });
+                        }
+                        if (!window.__cscFontOverrideCssTimer) {
+                            window.__cscFontOverrideCssTimer = setInterval(ensureFontOverrideCss, 1000);
+                        }
+                        if (!window.__cscFontOverrideCssInjected) {
+                            window.__cscFontOverrideCssInjected = true;
+                            console.log('[CSC] 已注入字体覆盖 CSS');
+                        }
+                    }).catch(() => {}).finally(() => {
+                        window.__cscFontOverrideCssInstalling = false;
+                    });
+                }
+
                 function prepareCacheLoader() {
                     if (typeof __require !== 'function' || typeof window.cc !== 'object') {
                         requestAnimationFrame(prepareCacheLoader);
@@ -4509,23 +4763,46 @@ window.addEventListener('DOMContentLoaded', () => {
                     if (!version) { requestAnimationFrame(prepareCacheLoader); return; }
 
                     let clientHost = window.location.protocol + '//' + window.location.host + '/';
-                    window.electronAPI.setCacheConfig({ clientVersion: version, clientHost: clientHost });
+                    window.electronAPI.setCacheConfig({
+                        clientVersion: version,
+                        clientHost: clientHost,
+                        fontOverrideVersion: fontOverrideVersion
+                    });
 
-                    let originalLoad = window.cc.assetManager.packManager.load;
+                    let packManager = window.cc.assetManager.packManager;
+                    if (!packManager.__cscOriginalLoad && typeof packManager.load === 'function') {
+                        packManager.__cscOriginalLoad = packManager.load;
+                    }
+                    if (typeof packManager.__cscOriginalLoad !== 'function') {
+                        requestAnimationFrame(prepareCacheLoader);
+                        return;
+                    }
+                    let originalLoad = packManager.__cscOriginalLoad;
                     let pathname = window.location.pathname;
                     let pathStr = pathname.substring(0, pathname.lastIndexOf('/')) + '/';
+                    let fontOverrideCacheBust = Date.now();
+
+                    function appendFontOverrideCacheBust(url) {
+                        if (typeof url !== 'string' || !/\.ttf(?:[?#]|$)/i.test(url)) return url;
+                        let joiner = url.indexOf('?') >= 0 ? '&' : '?';
+                        return url + joiner + 'csc_font_override=' + fontOverrideCacheBust;
+                    }
 
                     window.electronAPI.getProxyPort().then(port => {
                         if (!port) return;
                         let newHost = 'http://localhost:' + port + '/';
+                        injectFontOverrideCss();
 
                         // 1. Intercept client assets
-                        window.cc.assetManager.packManager.load = function (t) {
-                            if (!t || !t.url) return originalLoad.apply(this, arguments);
-                            if (t.url.startsWith('http')) return originalLoad.apply(this, arguments);
-                            t.url = newHost + 'client' + pathStr + t.url;
-                            return originalLoad.apply(this, arguments);
-                        };
+                        if (!packManager.__cscCachePatched) {
+                            packManager.load = function (t) {
+                                if (!t || !t.url) return originalLoad.apply(this, arguments);
+                                if (t.url.startsWith('http')) return originalLoad.apply(this, arguments);
+                                t.url = appendFontOverrideCacheBust(newHost + 'client' + pathStr + t.url);
+                                return originalLoad.apply(this, arguments);
+                            };
+                            packManager.__cscCachePatched = true;
+                        }
 
                         function waitForAssetLoader() {
                             let assetLoader = __require('Singleton').assetLoader;
@@ -4754,6 +5031,65 @@ window.addEventListener('DOMContentLoaded', () => {
                             return false;
                         }
 
+                        function getNodeName(node) {
+                            return String(node && (node.name || node._name || '') || '');
+                        }
+
+                        function getNodeSortZ(node) {
+                            var z = Number(node && (node.zIndex != null ? node.zIndex : node._localZOrder));
+                            return isFinite(z) ? z : 0;
+                        }
+
+                        function getNodeSortOrder(node) {
+                            var order = Number(node && node._orderOfArrival);
+                            return isFinite(order) ? order : 0;
+                        }
+
+                        function getNodeChain(node) {
+                            var chain = [];
+                            var current = node;
+                            var guard = 0;
+                            while (current && guard < 64) {
+                                chain.unshift(current);
+                                current = current.parent || current._parent || null;
+                                guard += 1;
+                            }
+                            return chain;
+                        }
+
+                        function compareSceneOrder(a, b) {
+                            if (!a || !b || a === b) return 0;
+                            var aChain = getNodeChain(a);
+                            var bChain = getNodeChain(b);
+                            var length = Math.min(aChain.length, bChain.length);
+                            var index = 0;
+                            while (index < length && aChain[index] === bChain[index]) {
+                                index += 1;
+                            }
+                            var aNode = aChain[index] || a;
+                            var bNode = bChain[index] || b;
+                            var zDiff = getNodeSortZ(aNode) - getNodeSortZ(bNode);
+                            if (zDiff !== 0) return zDiff;
+                            return getNodeSortOrder(aNode) - getNodeSortOrder(bNode);
+                        }
+
+                        function isModalBlockerNode(node) {
+                            if (!node || !node._activeInHierarchy) return false;
+                            var name = getNodeName(node).toLowerCase();
+                            return name === 'modal' || name === 'modallayer';
+                        }
+
+                        function getBlockingModal(selectedCandidate, modalBlockers) {
+                            if (!selectedCandidate || !Array.isArray(modalBlockers)) return null;
+                            for (var i = 0; i < modalBlockers.length; i++) {
+                                var blocker = modalBlockers[i];
+                                if (compareSceneOrder(blocker, selectedCandidate.node) >= 0) {
+                                    return blocker;
+                                }
+                            }
+                            return null;
+                        }
+
                         function getLongPressHandler(component) {
                             if (!component) return null;
                             var keys = Object.keys(component);
@@ -4783,6 +5119,7 @@ window.addEventListener('DOMContentLoaded', () => {
                         // smallest bbox area first (most specific visual target),
                         // then closest bbox centre as tiebreaker.
                         var candidates = [];
+                        var modalBlockers = [];
 
                         function gatherCandidates(node) {
                             if (!node || !node._activeInHierarchy) return;
@@ -4799,6 +5136,9 @@ window.addEventListener('DOMContentLoaded', () => {
                                 bbox = node.getBoundingBoxToWorld();
                             } catch (e) { return; }
                             if (!bbox || !bbox.contains(mousePosition)) return;
+                            if (isModalBlockerNode(node)) {
+                                modalBlockers.push(node);
+                            }
 
                             if (!Array.isArray(node._components)) return;
                             for (var j = 0; j < node._components.length; j++) {
@@ -4807,6 +5147,7 @@ window.addEventListener('DOMContentLoaded', () => {
                                 var handler = getLongPressHandler(component);
                                 if (typeof handler !== 'function') continue;
                                 candidates.push({
+                                    node: node,
                                     component: component,
                                     handler: handler,
                                     area: bbox.width * bbox.height,
@@ -4827,6 +5168,8 @@ window.addEventListener('DOMContentLoaded', () => {
                         });
 
                         try {
+                            var blockingModal = getBlockingModal(candidates[0], modalBlockers);
+                            if (blockingModal) return false;
                             candidates[0].handler.apply(candidates[0].component);
                             return true;
                         } catch (e) {}

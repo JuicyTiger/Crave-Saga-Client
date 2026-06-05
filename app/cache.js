@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const mime = require('mime-types');
 const decompressResponse = require('decompress-response');
 const { ProxyAgent } = require('proxy-agent');
+const { buildFontOverrideCss, getFontOverrideForRequest, getFontOverrideSummary } = require('./font-overrides');
 
 const defaultCacheFolder = path.resolve(__dirname, '..', 'cache');
 let cacheFolder = defaultCacheFolder;
@@ -46,6 +47,7 @@ anyGlobal.cacheLoader = true;
 anyGlobal.resourceProxyPort = 0;
 
 let streamWatch = {};
+const loggedFontOverrideCssRequests = new Set();
 const ensuredClientCacheFolders = new Set();
 const createWriteStream = filePath => {
   if (streamWatch[filePath]) {
@@ -183,10 +185,47 @@ function appendVaryHeader(existingVary, token) {
   return values.join(', ');
 }
 
+function writeFontOverrideResponse(req, res, requestOrigin, override) {
+  const responseHeaders = {
+    'content-type': override.contentType,
+    'content-length': String(override.size),
+    'access-control-allow-origin': requestOrigin,
+    'access-control-allow-credentials': 'true',
+    'access-control-allow-methods': '*',
+    vary: appendVaryHeader('', 'Origin'),
+    'cache-control': 'no-store',
+  };
+
+  res.writeHead(200, responseHeaders);
+  const fileStream = fs.createReadStream(override.filePath);
+  fileStream.pipe(res);
+  fileStream.on('error', e => {
+    console.error(`[FontOverride] 字体覆盖文件读取失败: ${override.filePath}`);
+    console.error(e);
+    res.end();
+  });
+  req.on('error', e => {
+    console.error(e);
+  });
+  res.on('close', () => {
+    fileStream.destroy();
+  });
+  res.on('error', e => {
+    console.error(e);
+  });
+}
+
 module.exports = {
   setup: options => {
     setCacheRoot(options?.cacheFolder);
     ensureCacheFolders();
+    const fontOverrideSummary = getFontOverrideSummary();
+    console.log(
+      `[FontOverride] 字体覆盖${fontOverrideSummary.enabled ? '已启用' : '已禁用'}; ` +
+      fontOverrideSummary.rules
+        .map(rule => `${rule.fontName} -> ${rule.filePath}${rule.exists ? '' : ' (文件不存在)'}`)
+        .join('; ')
+    );
 
     const http = require('http');
     const https = require('https');
@@ -219,6 +258,31 @@ module.exports = {
         let clientAsset = false;
         let cacheFolderReady = true;
         let targetCacheFolder = cacheFolder;
+        if (url.startsWith('/font-overrides/')) {
+          const [fontOverrideUrlPath] = url.substring('/font-overrides/'.length).split('?');
+          const fontOverridePath = '/' + decodeURIComponent(fontOverrideUrlPath);
+          const fontOverride = getFontOverrideForRequest(fontOverridePath, {
+            clientHost: anyGlobal.clientHost,
+            version: anyGlobal.fontOverrideVersion,
+          });
+          if (fontOverride) {
+            const fontOverrideLogKey = `${fontOverride.targetKey}:${fontOverride.requestedFontName}`;
+            if (!loggedFontOverrideCssRequests.has(fontOverrideLogKey)) {
+              loggedFontOverrideCssRequests.add(fontOverrideLogKey);
+              console.log(`[FontOverride CSS] ${fontOverride.targetKey}/${fontOverride.requestedFontName} -> ${fontOverride.filePath}`);
+            }
+            writeFontOverrideResponse(req, res, requestOrigin, fontOverride);
+            return;
+          }
+          res.writeHead(404, {
+            'access-control-allow-origin': requestOrigin,
+            'access-control-allow-credentials': 'true',
+            'access-control-allow-methods': '*',
+            vary: appendVaryHeader('', 'Origin'),
+          });
+          res.end();
+          return;
+        }
         // check whether first part of req.url is resource
         if (url.startsWith('/resources/')) {
           resourceHost = anyGlobal.resourceHost ? new URL(anyGlobal.resourceHost) : null;
@@ -291,6 +355,18 @@ module.exports = {
 
         // create file write stream if it's an asset
         const filePath = path.join(targetCacheFolder, filename);
+
+        const fontOverride = clientAsset && isGetRequest
+          ? getFontOverrideForRequest(url, {
+            clientHost: resourceHost.href,
+            version: anyGlobal.fontOverrideVersion,
+          })
+          : null;
+        if (fontOverride) {
+          console.log(`[FontOverride HIT] ${fontOverride.targetKey}/${fontOverride.requestedFontName} -> ${fontOverride.filePath}`);
+          writeFontOverrideResponse(req, res, requestOrigin, fontOverride);
+          return;
+        }
 
         let cachedFileStat = null;
         if (shouldUseCache) {
@@ -490,4 +566,12 @@ module.exports = {
     server?.close();
   },
   getResourceCacheFolder: () => resourceCacheFolder,
+  getFontOverrideCss: () => {
+    const port = anyGlobal.resourceProxyPort || 0;
+    if (!port) return '';
+    return buildFontOverrideCss(`http://localhost:${port}`, {
+      clientHost: anyGlobal.clientHost,
+      version: anyGlobal.fontOverrideVersion,
+    });
+  },
 };
