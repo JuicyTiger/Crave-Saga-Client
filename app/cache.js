@@ -200,7 +200,7 @@ function writeFontOverrideResponse(req, res, requestOrigin, override) {
   const fileStream = fs.createReadStream(override.filePath);
   fileStream.pipe(res);
   fileStream.on('error', e => {
-    console.error(`[FontOverride] 字体覆盖文件读取失败: ${override.filePath}`);
+    console.error(`[FontOverride] Failed to stream ${override.filePath}`);
     console.error(e);
     res.end();
   });
@@ -221,9 +221,9 @@ module.exports = {
     ensureCacheFolders();
     const fontOverrideSummary = getFontOverrideSummary();
     console.log(
-      `[FontOverride] 字体覆盖${fontOverrideSummary.enabled ? '已启用' : '已禁用'}; ` +
+      `[FontOverride] ${fontOverrideSummary.enabled ? 'Enabled' : 'Disabled'}; ` +
       fontOverrideSummary.rules
-        .map(rule => `${rule.fontName} -> ${rule.filePath}${rule.exists ? '' : ' (文件不存在)'}`)
+        .map(rule => `${rule.fontName} -> ${rule.filePath}${rule.exists ? '' : ' (missing)'}`)
         .join('; ')
     );
 
@@ -367,7 +367,6 @@ module.exports = {
           writeFontOverrideResponse(req, res, requestOrigin, fontOverride);
           return;
         }
-
         let cachedFileStat = null;
         if (shouldUseCache) {
           try {

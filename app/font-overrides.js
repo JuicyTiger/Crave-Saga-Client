@@ -12,7 +12,7 @@ const FONT_CONTENT_TYPES = Object.freeze({
 const FONT_VERSION_DEFINITIONS = Object.freeze([
   {
     id: 'tw',
-    label: '繁体中文',
+    label: '繁體中文',
     hostPatterns: [
       /dl4zp4nhv8if1\.cloudfront\.net$/i,
       /erolabs-client-ch\.r\.cravesaga\.johren\.games$/i,
@@ -36,7 +36,7 @@ const FONT_VERSION_DEFINITIONS = Object.freeze([
   },
   {
     id: 'ja',
-    label: '日本语',
+    label: '日本語',
     hostPatterns: [
       /gg-client-[wr]\.crave-saga\.net$/i,
       /gg-dmm-gadgets\.crave-saga\.net$/i,
@@ -45,14 +45,54 @@ const FONT_VERSION_DEFINITIONS = Object.freeze([
 ]);
 
 const FONT_TARGETS = Object.freeze([
-  { key: 'twBold', version: 'tw', label: 'ResourceHanRoundedTW-Bold', fontName: 'ResourceHanRoundedTW-Bold.ttf' },
-  { key: 'twHeavy', version: 'tw', label: 'ResourceHanRoundedTW-Heavy', fontName: 'ResourceHanRoundedTW-Heavy.ttf' },
-  { key: 'cnHeavy', version: 'cn', label: 'ResourceHanRoundedCN-Heavy', fontName: 'ResourceHanRoundedCN-Heavy.ttf' },
-  { key: 'cnBold', version: 'cn', label: 'ResourceHanRoundedCN-Bold', fontName: 'ResourceHanRoundedCN-Bold.ttf' },
-  { key: 'enText', version: 'en', label: 'TTF-NPRodin-EB', fontName: 'TTF-NPRodin-EB.ttf' },
-  { key: 'enTextBold', version: 'en', label: 'TTF-NPRodin-B', fontName: 'TTF-NPRodin-B.ttf' },
-  { key: 'jaText', version: 'ja', label: 'UDKakugo_LargePr6N-HV', fontName: 'UDKakugo_LargePr6N-HV.ttf' },
-  { key: 'jaTextBold', version: 'ja', label: 'UDKakugo_LargePr6N-B', fontName: 'UDKakugo_LargePr6N-B.ttf' },
+  {
+    key: 'twBold',
+    version: 'tw',
+    label: 'ResourceHanRoundedTW-Bold',
+    fontName: 'ResourceHanRoundedTW-Bold.ttf',
+  },
+  {
+    key: 'twHeavy',
+    version: 'tw',
+    label: 'ResourceHanRoundedTW-Heavy',
+    fontName: 'ResourceHanRoundedTW-Heavy.ttf',
+  },
+  {
+    key: 'cnHeavy',
+    version: 'cn',
+    label: 'ResourceHanRoundedCN-Heavy',
+    fontName: 'ResourceHanRoundedCN-Heavy.ttf',
+  },
+  {
+    key: 'cnBold',
+    version: 'cn',
+    label: 'ResourceHanRoundedCN-Bold',
+    fontName: 'ResourceHanRoundedCN-Bold.ttf',
+  },
+  {
+    key: 'enText',
+    version: 'en',
+    label: 'TTF-NPRodin-EB',
+    fontName: 'TTF-NPRodin-EB.ttf',
+  },
+  {
+    key: 'enTextBold',
+    version: 'en',
+    label: 'TTF-NPRodin-B',
+    fontName: 'TTF-NPRodin-B.ttf',
+  },
+  {
+    key: 'jaText',
+    version: 'ja',
+    label: 'UDKakugo_LargePr6N-HV',
+    fontName: 'UDKakugo_LargePr6N-HV.ttf',
+  },
+  {
+    key: 'jaTextBold',
+    version: 'ja',
+    label: 'UDKakugo_LargePr6N-B',
+    fontName: 'UDKakugo_LargePr6N-B.ttf',
+  },
 ]);
 
 const DEFAULT_FONT_NAMES = Object.freeze([...new Set(FONT_TARGETS.map(target => target.fontName))]);
@@ -95,7 +135,7 @@ function getPackagedUserDataPath() {
       return app.getPath('userData');
     }
   } catch (_) {
-    // 非 Electron 环境下使用仓库内 custom 目录。
+    // Non-Electron test runs use the repo-local custom directory.
   }
   return '';
 }
@@ -122,7 +162,12 @@ function createFontOverridePaths(options = {}) {
   const customRoot = resolveDefaultCustomRoot(repoRoot, options);
   const configPath = path.resolve(options.configPath || path.join(customRoot, 'font-overrides.json'));
   const defaultFontRoot = path.resolve(options.defaultFontRoot || path.join(customRoot, 'fonts'));
-  return { repoRoot, customRoot, configPath, defaultFontRoot };
+  return {
+    repoRoot,
+    customRoot,
+    configPath,
+    defaultFontRoot,
+  };
 }
 
 function resolveDefaultFontPath(defaultFontRoot, fontName) {
@@ -154,6 +199,10 @@ function resolveRulePath(value, repoRoot, customRoot) {
 
 function getFontTarget(targetKey) {
   return FONT_TARGETS.find(target => target.key === targetKey) || null;
+}
+
+function getVersionDefinition(versionId) {
+  return FONT_VERSION_DEFINITIONS.find(version => version.id === versionId) || null;
 }
 
 function normalizeHost(value) {
@@ -196,7 +245,7 @@ function readFontOverrideConfig(options = {}) {
     const parsed = JSON.parse(fs.readFileSync(configPath, 'utf8'));
     return parsed && typeof parsed === 'object' ? parsed : null;
   } catch (error) {
-    console.warn(`[FontOverride] 读取字体覆盖配置失败: ${configPath}; ${error?.message || error}`);
+    console.warn(`[FontOverride] Failed to read ${configPath}: ${error?.message || error}`);
     return null;
   }
 }
@@ -241,7 +290,10 @@ function loadFontOverrideRules(options = {}) {
     });
   }
 
-  return { enabled, rules };
+  return {
+    enabled,
+    rules,
+  };
 }
 
 function getFontOverrideSettings(options = {}) {
@@ -285,7 +337,7 @@ function normalizeFontOverrideSettings(input) {
     if (value && !isSupportedFontPath(value)) {
       const ext = path.extname(value || '').toLowerCase() || '(none)';
       throw new Error(
-        `${target.label} 使用了不支持的字体扩展名 ${ext}; 支持格式: ${getSupportedFontExtensionsLabel()}`
+        `${target.label} uses unsupported font extension ${ext}; supported: ${getSupportedFontExtensionsLabel()}`
       );
     }
     targets[target.key] = value;

@@ -685,14 +685,20 @@
           cookieHosts: [erolabsUrl],
           loginRegex: [createRegexContract('login\\.html')],
           pageRegex: [
+            createRegexContract('\\/(?:en|cn|zh)\\/(?:$|index\\.html(?:[?#]|$))'),
+            createRegexContract('\\/(?:en|cn|zh)\\/game\\/crave-saga-x(?:[?#]|$)'),
             createRegexContract('webGL\\.html\\?id=47'),
+            createRegexContract('webGLforCloud\\.html\\?id=47'),
             createRegexContract('game\\.html\\?id=47'),
           ],
           gameRegex: [
             createRegexContract('https:\\/\\/erolabs-client-(?:ch|en)\\.r\\.cravesaga\\.johren\\.games'),
             createRegexContract('\\.cloudfront\\.net'),
           ],
-          wrapperRegex: [],
+          wrapperRegex: [
+            createRegexContract('webGL\\.html\\?id=47'),
+            createRegexContract('webGLforCloud\\.html\\?id=47'),
+          ],
           langs: [
             { id: 'en', name: 'English', url: 'https://' + erolabsUrl + '/en/game.html?id=47' },
             { id: 'cn', name: '简体中文', url: 'https://' + erolabsUrl + '/cn/game.html?id=47' },

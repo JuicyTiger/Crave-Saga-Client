@@ -10,3 +10,5 @@ Thumbs.db
 .vscode/
 .cache/
 scripts/
+__pycache__/
+*.pyc

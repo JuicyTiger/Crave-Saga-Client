@@ -30,6 +30,7 @@ let tray = null;
 let isQuitting = false;
 let contextMenuPopupHandler = null;
 let persistedWindowBounds = null;
+let setupMasterDataAutoCapture = () => {};
 let sidecarPanelWindow = null;
 let sidecarPanelVisible = false;
 const SIDECAR_PANEL_WIDTH = 360;
@@ -1310,58 +1311,57 @@ function hasCommandOrControlModifier(modifiers, options = {}) {
 
 async function isEditableElementFocused() {
     if (!hasMainWindow()) return false;
+    const editableFocusScript = `(() => {
+        const blockedInputTypes = new Set(['checkbox', 'radio', 'button', 'submit', 'reset', 'range', 'color']);
+        const visitedRoots = new WeakSet();
+
+        function isEditableElement(element) {
+            if (!element) return false;
+            if (element.isContentEditable) return true;
+            const tag = (element.tagName || '').toLowerCase();
+            if (tag === 'textarea' || tag === 'select') return true;
+            if (tag === 'input') {
+                const inputType = (element.type || '').toLowerCase();
+                return !blockedInputTypes.has(inputType);
+            }
+            return element.getAttribute && element.getAttribute('role') === 'textbox';
+        }
+
+        function findFocusedEditable(root) {
+            if (!root || visitedRoots.has(root)) return false;
+            visitedRoots.add(root);
+
+            let active = null;
+            try {
+                active = root.activeElement;
+            } catch {
+                return false;
+            }
+            if (!active) return false;
+            if (isEditableElement(active)) return true;
+
+            if (active.shadowRoot) {
+                const shadowEditable = findFocusedEditable(active.shadowRoot);
+                if (shadowEditable) return true;
+            }
+
+            return false;
+        }
+
+        return findFocusedEditable(document);
+    })()`;
     try {
-        return await mainWindow.webContents.executeJavaScript(
-            `(() => {
-                const blockedInputTypes = new Set(['checkbox', 'radio', 'button', 'submit', 'reset', 'range', 'color']);
-                const visitedDocuments = new WeakSet();
-
-                function isEditableElement(element) {
-                    if (!element) return false;
-                    if (element.isContentEditable) return true;
-                    const tag = (element.tagName || '').toLowerCase();
-                    if (tag === 'textarea' || tag === 'select') return true;
-                    if (tag === 'input') {
-                        const inputType = (element.type || '').toLowerCase();
-                        return !blockedInputTypes.has(inputType);
-                    }
-                    return element.getAttribute && element.getAttribute('role') === 'textbox';
-                }
-
-                function findFocusedEditable(doc) {
-                    if (!doc || visitedDocuments.has(doc)) return false;
-                    visitedDocuments.add(doc);
-
-                    let active = null;
-                    try {
-                        active = doc.activeElement;
-                    } catch {
-                        return false;
-                    }
-                    if (!active) return false;
-                    if (isEditableElement(active)) return true;
-
-                    if (active.shadowRoot) {
-                        const shadowEditable = findFocusedEditable(active.shadowRoot);
-                        if (shadowEditable) return true;
-                    }
-
-                    const tag = (active.tagName || '').toLowerCase();
-                    if (tag === 'iframe' || tag === 'frame') {
-                        try {
-                            return findFocusedEditable(active.contentDocument);
-                        } catch {
-                            return false;
-                        }
-                    }
-
-                    return false;
-                }
-
-                return findFocusedEditable(document);
-            })()`,
-            true
-        );
+        const mainFrame = mainWindow.webContents.mainFrame;
+        const frames = mainFrame ? collectAutomationFrames(mainFrame) : [];
+        for (const frame of frames) {
+            if (!frame || typeof frame.executeJavaScript !== 'function') continue;
+            try {
+                if (await frame.executeJavaScript(editableFocusScript, true)) return true;
+            } catch (_) {
+                // A frame may disappear while the game wrapper is navigating.
+            }
+        }
+        return false;
     } catch {
         return false;
     }
@@ -1626,6 +1626,8 @@ function quitApplication() {
 }
 
 let mobileNotifyConfigWin = null;
+let characterStatusMonitorWin = null;
+
 function openMobileNotifyConfig() {
     if (mobileNotifyConfigWin && !mobileNotifyConfigWin.isDestroyed()) {
         mobileNotifyConfigWin.focus();
@@ -1648,6 +1650,36 @@ function openMobileNotifyConfig() {
     mobileNotifyConfigWin.setMenuBarVisibility(false);
     mobileNotifyConfigWin.loadFile(path.join(__dirname, 'notification-settings.html'));
     mobileNotifyConfigWin.on('closed', () => { mobileNotifyConfigWin = null; });
+}
+
+function openCharacterStatusMonitorWindow() {
+    if (characterStatusMonitorWin && !characterStatusMonitorWin.isDestroyed()) {
+        if (characterStatusMonitorWin.isMinimized()) characterStatusMonitorWin.restore();
+        characterStatusMonitorWin.show();
+        characterStatusMonitorWin.focus();
+        return { ok: true, reused: true };
+    }
+
+    characterStatusMonitorWin = new BrowserWindow({
+        width: 380,
+        height: 700,
+        minWidth: 340,
+        minHeight: 520,
+        resizable: true,
+        alwaysOnTop: true,
+        title: 'Character Status Monitor',
+        icon: path.join(__dirname, 'icon.png'),
+        webPreferences: {
+            preload: path.join(__dirname, 'preload.js'),
+            contextIsolation: true,
+            nodeIntegration: false
+        }
+    });
+    characterStatusMonitorWin.setAlwaysOnTop(true);
+    characterStatusMonitorWin.setMenuBarVisibility(false);
+    characterStatusMonitorWin.loadFile(path.join(__dirname, 'character-status-monitor.html'));
+    characterStatusMonitorWin.on('closed', () => { characterStatusMonitorWin = null; });
+    return { ok: true, reused: false };
 }
 
 function buildTrayMenu() {
@@ -1944,6 +1976,10 @@ function buildContextMenu() {
             submenu: notificationMenu
         },
         ...(languageMenuItem ? [languageMenuItem] : []),
+        {
+            label: 'Character status monitor',
+            click: () => void runCommandDispatcher('openCharacterStatusMonitor')
+        },
         { type: 'separator' },
         {
             label: 'Change provider',
@@ -2159,6 +2195,7 @@ async function ensureWebSecurityModeForUrl(url) {
             currentWindow.destroy();
         }
 
+        setupMasterDataAutoCapture();
         console.log(`[Security] Switched webSecurity=${desiredWebSecurity} for ${url}`);
         return true;
     } finally {
@@ -2401,10 +2438,9 @@ function createWindow(options = {}) {
     });
 
     mainWindow.webContents.on('did-finish-load', () => {
-        if (gameCommandState.blackout) {
-            emitRendererCommand('setBlackout', { enabled: true });
-            syncBlackoutPointerTracking();
-        }
+        if (!gameCommandState.blackout) return;
+        emitRendererCommand('setBlackout', { enabled: true });
+        syncBlackoutPointerTracking();
     });
 
     return mainWindow;
@@ -2762,14 +2798,66 @@ function buildAutomationEvalSource(rawSource) {
     })()`;
 }
 
-async function evaluateAutomationScript(rawSource) {
-    const targetWindow = findActiveWindow();
+function collectAutomationFrames(rootFrame) {
+    const frames = [];
+
+    function visit(frame) {
+        if (!frame) return;
+        frames.push(frame);
+        const childFrames = Array.isArray(frame.frames) ? frame.frames : [];
+        for (const childFrame of childFrames) {
+            visit(childFrame);
+        }
+    }
+
+    visit(rootFrame);
+    return frames;
+}
+
+async function frameHasCocosRuntime(frame) {
+    if (!frame || typeof frame.executeJavaScript !== 'function') return false;
+    try {
+        return await frame.executeJavaScript(
+            `(() => {
+                try {
+                    return !!(window.cc && cc.director && typeof cc.director.getScene === 'function');
+                } catch (_) {
+                    return false;
+                }
+            })()`,
+            true
+        );
+    } catch (_) {
+        return false;
+    }
+}
+
+async function findAutomationExecutionFrame(targetWindow) {
+    const mainFrame = targetWindow?.webContents?.mainFrame;
+    if (!mainFrame) return null;
+
+    const frames = collectAutomationFrames(mainFrame);
+    for (const frame of frames) {
+        if (await frameHasCocosRuntime(frame)) return frame;
+    }
+    return mainFrame;
+}
+
+async function evaluateAutomationScript(rawSource, preferredWindow = null) {
+    const targetWindow = preferredWindow && !preferredWindow.isDestroyed()
+        ? preferredWindow
+        : findActiveWindow();
     if (!targetWindow) {
         return 'Error: Main window is unavailable';
     }
 
     try {
         const wrappedSource = buildAutomationEvalSource(rawSource);
+        const executionFrame = await findAutomationExecutionFrame(targetWindow);
+        if (executionFrame && typeof executionFrame.executeJavaScript === 'function') {
+            const result = await executionFrame.executeJavaScript(wrappedSource, true);
+            return result == null ? '' : String(result);
+        }
         const result = await targetWindow.webContents.executeJavaScript(wrappedSource, true);
         return result == null ? '' : String(result);
     } catch (error) {
@@ -2777,6 +2865,1590 @@ async function evaluateAutomationScript(rawSource) {
     }
 }
 
+const CHARACTER_STATUS_PROBE_SOURCE = `
+(function() {
+    const MAX_NODES = 2000;
+    const MAX_COCOS_NODES = 700;
+    const MAX_DEPTH = 7;
+    const MAX_CANDIDATES = 20;
+    const MAX_LABELS = 300;
+
+    function nowIso() {
+        try { return new Date().toISOString(); } catch (_) { return null; }
+    }
+
+    function isObject(value) {
+        return !!value && (typeof value === 'object' || typeof value === 'function');
+    }
+
+    function normalizeKey(key) {
+        return String(key || '').replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+    }
+
+    function numberOrNull(value) {
+        const numberValue = Number(value);
+        if (!Number.isFinite(numberValue)) return null;
+        return numberValue;
+    }
+
+    const statAliases = {
+        hp: ['hp', 'maxhp', 'hitpoint', 'hitpoints', 'health'],
+        atk: ['atk', 'attack', 'physicalattack', 'physicalatk', 'str'],
+        matk: ['matk', 'magicattack', 'magicatk', 'magicalattack', 'int'],
+        def: ['def', 'defense', 'physicaldefense', 'physicaldef'],
+        mdef: ['mdef', 'magicdefense', 'magicdef', 'magicaldefense'],
+        spd: ['spd', 'speed', 'agi', 'agility'],
+        mind: ['mind', 'mnd']
+    };
+
+    const TARGET_LAYER_NAMES = [
+        'DeckCharacterListLayer',
+        'DeckSummonListLayer',
+        'UnitCharacterAwakeTree',
+        'UnitCharacterAwakeDetail',
+        'UnitCharacterFortify'
+    ];
+
+    const CHARACTER_SUMMARY_STAT_ALIASES = {
+        totalPower: ['totalpower', 'totalstatus'],
+        hp: ['hp', 'maxhp', 'hitpoint', 'hitpoints', 'health'],
+        atk: ['atk', 'atkp', 'attack', 'attackp', 'physicalattack', 'physicalattackp', 'physicalatk', 'physicalatkp', 'str'],
+        matk: ['matk', 'matkp', 'atkm', 'magicattack', 'magicattackp', 'magicatk', 'magicatkp', 'magicalattack', 'magicalattackp', 'int'],
+        def: ['def', 'defp', 'defense', 'physicaldefense', 'physicaldef', 'physicaldefp'],
+        mdef: ['mdef', 'mdefp', 'defm', 'magicdefense', 'magicdef', 'magicaldefense', 'magicaldef'],
+        spd: ['spd', 'speed', 'agi', 'agility'],
+        mind: ['mind', 'mnd']
+    };
+
+    const CHARACTER_SUMMARY_METHODS = {
+        totalPower: ['getTotalStatusWithEquip', 'getTotalStatus'],
+        hp: ['getHpWithEquip', 'getHp'],
+        atk: ['getAtkPhysicsWithEquip', 'getAtkPhysics'],
+        matk: ['getAtkMagicWithEquip', 'getAtkMagic'],
+        def: ['getDefPhysicsWithEquip', 'getDefPhysics'],
+        mdef: ['getDefMagicWithEquip', 'getDefMagic'],
+        spd: ['getSpdWithEquip', 'getSpd'],
+        mind: ['getMindWithEquip', 'getMind']
+    };
+
+    const CHARACTER_SUMMARY_CORE_STATS = ['hp', 'atk', 'matk', 'def', 'mdef', 'spd', 'mind'];
+
+    const VIEW_MODEL_KEY_HINTS = [
+        'id', 'unit', 'character', 'chara', 'member', 'deck', 'party', 'formation',
+        'status', 'stat', 'level', 'lv', 'awake', 'rank', 'rare', 'rarity',
+        'hp', 'atk', 'matk', 'def', 'mdef', 'spd', 'mind'
+    ];
+
+    const aliasToStat = {};
+    for (const statName of Object.keys(statAliases)) {
+        for (const alias of statAliases[statName]) aliasToStat[alias] = statName;
+    }
+
+    function shortString(value, limit) {
+        const text = String(value == null ? '' : value).trim();
+        if (!text) return '';
+        return text.length > limit ? text.slice(0, limit) : text;
+    }
+
+    function normalizeLabelText(value) {
+        return String(value == null ? '' : value)
+            .replace(/[\\s.:：]/g, '')
+            .toUpperCase();
+    }
+
+    function numberFromLabel(value) {
+        const text = String(value == null ? '' : value).replace(/,/g, '').trim();
+        if (!/^[+-]?\\d+(?:\\.\\d+)?%?$/.test(text)) return null;
+        return numberOrNull(text.replace('%', ''));
+    }
+
+    function safeOwnEntries(value) {
+        if (!isObject(value)) return [];
+        let names = [];
+        try { names = Object.getOwnPropertyNames(value); } catch (_) { return []; }
+        const entries = [];
+        for (const name of names.slice(0, 80)) {
+            let descriptor = null;
+            try { descriptor = Object.getOwnPropertyDescriptor(value, name); } catch (_) { continue; }
+            if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) continue;
+            entries.push([name, descriptor.value]);
+        }
+        return entries;
+    }
+
+    function constructorName(value) {
+        try {
+            const name = value && value.constructor && value.constructor.name;
+            return typeof name === 'string' && name ? name : null;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function readLabel(value) {
+        const labelKeys = [
+            'name', '_name', 'unitName', 'characterName', 'charaName', 'displayName',
+            'id', 'unitId', 'characterId', 'charaId', 'characterMainId'
+        ];
+        const out = {};
+        for (const key of labelKeys) {
+            try {
+                if (Object.prototype.hasOwnProperty.call(value, key)) {
+                    const item = value[key];
+                    if (typeof item === 'string' || typeof item === 'number') out[key] = item;
+                }
+            } catch (_) {}
+        }
+        return out;
+    }
+
+    function collectStats(value) {
+        const stats = {};
+        const matchedKeys = {};
+        const entries = safeOwnEntries(value);
+        for (const [key, item] of entries) {
+            const normalized = normalizeKey(key);
+            const statName = aliasToStat[normalized];
+            if (!statName) continue;
+            const numberValue = numberOrNull(item);
+            if (numberValue == null) continue;
+            if (stats[statName] == null) {
+                stats[statName] = numberValue;
+                matchedKeys[statName] = key;
+            }
+        }
+        return { stats, matchedKeys };
+    }
+
+    const summaryAliasToStat = {};
+    for (const statName of Object.keys(CHARACTER_SUMMARY_STAT_ALIASES)) {
+        for (const alias of CHARACTER_SUMMARY_STAT_ALIASES[statName]) summaryAliasToStat[alias] = statName;
+    }
+
+    function getNodeName(node) {
+        try {
+            const name = node && node.name;
+            return typeof name === 'string' ? shortString(name, 80) : '';
+        } catch (_) {
+            return '';
+        }
+    }
+
+    function getNodeChildren(node) {
+        try {
+            if (Array.isArray(node.children)) return node.children;
+            if (Array.isArray(node._children)) return node._children;
+        } catch (_) {}
+        return [];
+    }
+
+    function getNodeComponents(node) {
+        try {
+            if (typeof node.getComponents === 'function' && window.cc && cc.Component) {
+                const components = node.getComponents(cc.Component);
+                if (Array.isArray(components)) return components;
+            }
+        } catch (_) {}
+        try {
+            if (Array.isArray(node._components)) return node._components;
+        } catch (_) {}
+        return [];
+    }
+
+    function getFirstComponent(node) {
+        const components = getNodeComponents(node);
+        return components.length > 0 ? components[0] : null;
+    }
+
+    function readPathValue(target, path) {
+        if (!target || !path) return undefined;
+        const parts = String(path).split('.');
+        let value = target;
+        for (const part of parts) {
+            if (!part) continue;
+            if (!value || typeof value !== 'object') return undefined;
+            value = value[part];
+        }
+        return value;
+    }
+
+    function readNodeNumber(node, publicKey, privateKey) {
+        try {
+            const value = node && node[publicKey];
+            if (Number.isFinite(Number(value))) return Number(value);
+        } catch (_) {}
+        try {
+            const value = readPathValue(node, privateKey);
+            if (Number.isFinite(Number(value))) return Number(value);
+        } catch (_) {}
+        return null;
+    }
+
+    function readNodeBool(node, publicKey, privateKey) {
+        try {
+            const value = node && node[publicKey];
+            if (typeof value === 'boolean') return value;
+        } catch (_) {}
+        try {
+            const value = readPathValue(node, privateKey);
+            if (typeof value === 'boolean') return value;
+        } catch (_) {}
+        return null;
+    }
+
+    function readNodeVisibility(node, parentVisible) {
+        const active = readNodeBool(node, 'active', '_active');
+        const activeInHierarchy = readNodeBool(node, 'activeInHierarchy', '_activeInHierarchy');
+        const opacity = readNodeNumber(node, 'opacity', '_opacity');
+        const width = readNodeNumber(node, 'width', '_contentSize.width');
+        const height = readNodeNumber(node, 'height', '_contentSize.height');
+        const x = readNodeNumber(node, 'x', '_position.x');
+        const y = readNodeNumber(node, 'y', '_position.y');
+        const locallyVisible =
+            active !== false &&
+            activeInHierarchy !== false &&
+            opacity !== 0;
+
+        return {
+            active,
+            activeInHierarchy,
+            opacity,
+            width,
+            height,
+            x,
+            y,
+            visible: parentVisible !== false && locallyVisible
+        };
+    }
+
+    function readComponentLabel(component) {
+        try {
+            if (typeof component.string === 'string' || typeof component.string === 'number') {
+                return shortString(component.string, 80);
+            }
+        } catch (_) {}
+        try {
+            if (typeof component._string === 'string' || typeof component._string === 'number') {
+                return shortString(component._string, 80);
+            }
+        } catch (_) {}
+        return '';
+    }
+
+    function shouldSampleViewModelKey(key) {
+        const normalized = normalizeKey(key);
+        if (!normalized) return false;
+        return VIEW_MODEL_KEY_HINTS.some(function(hint) {
+            return normalized.indexOf(hint) !== -1;
+        });
+    }
+
+    function summarizePrimitiveFields(value, limit, depth) {
+        const fields = [];
+        const entries = safeOwnEntries(value);
+        for (const [key, item] of entries) {
+            if (!shouldSampleViewModelKey(key)) continue;
+            if (typeof item === 'number' || typeof item === 'boolean') {
+                fields.push({ key, type: typeof item, value: item });
+            } else if (typeof item === 'string') {
+                fields.push({ key, type: 'string', value: shortString(item, 120) });
+            } else if (item == null) {
+                fields.push({ key, type: 'null', value: null });
+            } else if (Array.isArray(item)) {
+                const summary = { key, type: 'array', length: item.length };
+                if (depth < 1) {
+                    const items = [];
+                    for (let i = 0; i < item.length && i < 5; i += 1) {
+                        if (!isObject(item[i])) continue;
+                        const itemFields = summarizePrimitiveFields(item[i], 8, depth + 1);
+                        if (itemFields.length > 0) items.push({ index: i, fields: itemFields });
+                    }
+                    if (items.length > 0) summary.items = items;
+                }
+                fields.push(summary);
+            } else if (isObject(item)) {
+                const summary = { key, type: constructorName(item) || 'object' };
+                if (depth < 1) {
+                    const nestedFields = summarizePrimitiveFields(item, 8, depth + 1);
+                    if (nestedFields.length > 0) summary.fields = nestedFields;
+                }
+                fields.push(summary);
+            }
+            if (fields.length >= limit) break;
+        }
+        return fields;
+    }
+
+    function isTargetLayerName(nodeName) {
+        return TARGET_LAYER_NAMES.some(function(name) {
+            return String(nodeName || '').indexOf(name) !== -1;
+        });
+    }
+
+    function collectCocosLabels(rootNode, rootPath, maxNodes, maxLabels, captureTargetLayers) {
+        const labels = [];
+        const componentDataSamples = [];
+        const targetLayers = [];
+        const queue = [{ node: rootNode, path: rootPath, depth: 0, parentVisible: true }];
+        const seen = new WeakSet();
+        let visitedCount = 0;
+
+        while (queue.length > 0 && visitedCount < maxNodes) {
+            const item = queue.shift();
+            const node = item.node;
+            if (!isObject(node) || seen.has(node)) continue;
+            seen.add(node);
+            visitedCount += 1;
+
+            const nodeName = getNodeName(node);
+            const visibility = readNodeVisibility(node, item.parentVisible);
+            const childParentVisible = item.path === 'cc.director.getScene()' ? true : visibility.visible;
+            if (captureTargetLayers && isTargetLayerName(nodeName)) {
+                targetLayers.push({
+                    node,
+                    path: item.path,
+                    name: nodeName,
+                    constructor: constructorName(node),
+                    visibility
+                });
+            }
+
+            const components = getNodeComponents(node);
+            for (let i = 0; i < components.length; i += 1) {
+                const component = components[i];
+                if (!isObject(component)) continue;
+                const componentPath = item.path + '.components[' + i + ']';
+                const componentConstructor = constructorName(component);
+                const label = readComponentLabel(component);
+                if (label) {
+                    if (labels.length < maxLabels) {
+                        labels.push({
+                            text: label,
+                            path: componentPath,
+                            nodePath: item.path,
+                            nodeName,
+                            constructor: componentConstructor,
+                            visibility
+                        });
+                    }
+                }
+                const fields = summarizePrimitiveFields(component, 16, 0);
+                if (fields.length > 0 && componentDataSamples.length < 160) {
+                    componentDataSamples.push({
+                        path: componentPath,
+                        nodeName,
+                        constructor: componentConstructor,
+                        visibility,
+                        fields
+                    });
+                }
+            }
+
+            const children = getNodeChildren(node);
+            for (let i = 0; i < children.length; i += 1) {
+                const child = children[i];
+                if (!isObject(child)) continue;
+                const childName = getNodeName(child) || String(i);
+                queue.push({
+                    node: child,
+                    path: item.path + '.children[' + i + ':' + shortString(childName, 30) + ']',
+                    depth: item.depth + 1,
+                    parentVisible: childParentVisible
+                });
+            }
+        }
+
+        return { labels, componentDataSamples, targetLayers };
+    }
+
+    function buildLabelStatusCandidate(labels) {
+        const stats = {};
+        const matchedLabels = {};
+        for (let i = 0; i < labels.length; i += 1) {
+            const label = labels[i];
+            const normalized = normalizeLabelText(label.text);
+            const statName = aliasToStat[normalized.toLowerCase()];
+            if (!statName || stats[statName] != null) continue;
+
+            for (let offset = 1; offset <= 6 && i + offset < labels.length; offset += 1) {
+                const valueLabel = labels[i + offset];
+                const numberValue = numberFromLabel(valueLabel.text);
+                if (numberValue == null) continue;
+                stats[statName] = numberValue;
+                matchedLabels[statName] = {
+                    label: label.text,
+                    labelPath: label.path,
+                    value: valueLabel.text,
+                    valuePath: valueLabel.path
+                };
+                break;
+            }
+        }
+
+        const statCount = Object.keys(stats).length;
+        if (statCount < 3) return null;
+        return {
+            score: statCount * 10 + 2,
+            path: 'cocos-label-sequence',
+            depth: 0,
+            constructor: 'CocosLabels',
+            labels: {},
+            stats,
+            matchedKeys: matchedLabels
+        };
+    }
+
+    function statNameFromStatusValueNode(nodeName) {
+        const normalized = normalizeKey(nodeName);
+        const valueSuffix = 'valuenum';
+        if (!normalized.endsWith(valueSuffix)) return null;
+        const prefix = normalized.slice(0, -valueSuffix.length);
+        return aliasToStat[prefix] || null;
+    }
+
+    function statusGroupPathFromLabel(label) {
+        const nodePath = String(label && label.nodePath || '');
+        const marker = ':Status]';
+        const index = nodePath.indexOf(marker);
+        if (index === -1) return '';
+        return nodePath.slice(0, index + marker.length);
+    }
+
+    function buildStatusGroupCandidates(labels) {
+        const groups = new Map();
+        for (const label of labels) {
+            const statusPath = statusGroupPathFromLabel(label);
+            if (!statusPath) continue;
+            if (!groups.has(statusPath)) {
+                groups.set(statusPath, {
+                    path: statusPath,
+                    stats: {},
+                    matchedKeys: {},
+                    labels: [],
+                    zeroCount: 0,
+                    nonZeroCount: 0,
+                    visibleLabelCount: 0,
+                    hiddenLabelCount: 0
+                });
+            }
+            const group = groups.get(statusPath);
+            if (label.visibility && label.visibility.visible) group.visibleLabelCount += 1;
+            else group.hiddenLabelCount += 1;
+            group.labels.push({
+                text: label.text,
+                nodeName: label.nodeName,
+                path: label.path,
+                visibility: label.visibility || null
+            });
+
+            const statName = statNameFromStatusValueNode(label.nodeName);
+            if (!statName) continue;
+            const numberValue = numberFromLabel(label.text);
+            if (numberValue == null) continue;
+            group.stats[statName] = numberValue;
+            group.matchedKeys[statName] = {
+                nodeName: label.nodeName,
+                value: label.text,
+                valuePath: label.path
+            };
+            if (numberValue === 0) group.zeroCount += 1;
+            else group.nonZeroCount += 1;
+        }
+
+        const candidates = [];
+        for (const group of groups.values()) {
+            const statCount = Object.keys(group.stats).length;
+            if (statCount < 3) continue;
+
+            let score = statCount * 12 + group.nonZeroCount * 8 - group.zeroCount * 2;
+            if (/DeckCharacterListLayer|Character|Unit|Awake|Fortify/i.test(group.path)) score += 8;
+            if (/DeckSummonListLayer|Summon/i.test(group.path)) score -= 5;
+            if (group.nonZeroCount === 0) score -= 40;
+            if (group.visibleLabelCount > 0) score += 20;
+            if (group.visibleLabelCount === 0) score -= 80;
+
+            candidates.push({
+                score,
+                path: group.path,
+                depth: 0,
+                constructor: 'CocosStatusGroup',
+                labels: {},
+                stats: group.stats,
+                matchedKeys: group.matchedKeys,
+                statusLabels: group.labels.slice(0, 24),
+                nonZeroCount: group.nonZeroCount,
+                zeroCount: group.zeroCount,
+                visibleLabelCount: group.visibleLabelCount,
+                hiddenLabelCount: group.hiddenLabelCount
+            });
+        }
+
+        return candidates;
+    }
+
+    function collectLayerSummaries(targetLayers) {
+        const summaries = [];
+        for (const layer of targetLayers) {
+            if (!layer || !layer.node) continue;
+            const layerScan = collectCocosLabels(layer.node, layer.path, 1200, 500, false);
+            const layerLabels = layerScan.labels
+                .slice(0, 40)
+                .map(function(label) {
+                    return {
+                        text: label.text,
+                        nodeName: label.nodeName,
+                        nodePath: label.nodePath,
+                        visibility: label.visibility || null
+                    };
+                });
+            summaries.push({
+                path: layer.path,
+                name: layer.name,
+                constructor: layer.constructor,
+                visibility: layer.visibility || null,
+                labels: layerLabels,
+                componentDataSamples: layerScan.componentDataSamples.slice(0, 80)
+            });
+        }
+        return summaries;
+    }
+
+    function collectCharacterSummaryStats(value, stats, matchedPaths, path, depth) {
+        if (!isObject(value) || depth > 2) return;
+        const entries = safeOwnEntries(value);
+        for (const [key, item] of entries) {
+            const normalized = normalizeKey(key);
+            const statName = summaryAliasToStat[normalized];
+            if (statName && stats[statName] == null) {
+                const numberValue = numberOrNull(item);
+                if (numberValue != null) {
+                    stats[statName] = numberValue;
+                    matchedPaths[statName] = path + '.' + key;
+                }
+            }
+        }
+
+        for (const [key, item] of entries) {
+            if (!isObject(item)) continue;
+            if (key === 'masterData' || key === '_masterData') continue;
+            collectCharacterSummaryStats(item, stats, matchedPaths, path + '.' + key, depth + 1);
+        }
+    }
+
+    function collectCharacterSummaryMethodStats(value, stats, matchedPaths, path) {
+        if (!isObject(value)) return;
+        for (const statName of Object.keys(CHARACTER_SUMMARY_METHODS)) {
+            if (stats[statName] != null) continue;
+            for (const methodName of CHARACTER_SUMMARY_METHODS[statName]) {
+                let method = null;
+                try { method = value[methodName]; } catch (_) { method = null; }
+                if (typeof method !== 'function') continue;
+                let numberValue = null;
+                try { numberValue = numberOrNull(method.call(value)); } catch (_) { numberValue = null; }
+                if (numberValue == null) continue;
+                stats[statName] = numberValue;
+                matchedPaths[statName] = path + '.' + methodName + '()';
+                break;
+            }
+        }
+    }
+
+    function callGetterOrNull(value, methodNames) {
+        if (!isObject(value)) return null;
+        for (const methodName of methodNames) {
+            let method = null;
+            try { method = value[methodName]; } catch (_) { method = null; }
+            if (typeof method !== 'function') continue;
+            try {
+                const result = method.call(value);
+                if (result != null && result !== '') return result;
+            } catch (_) {}
+        }
+        return null;
+    }
+
+    function readUserDataValue(model, methodNames, propertyNames) {
+        const userData = isObject(model) && isObject(model.userData) ? model.userData : null;
+        const sources = userData ? [model, userData] : [model];
+        for (const source of sources) {
+            const getterValue = callGetterOrNull(source, methodNames);
+            if (getterValue != null) return getterValue;
+            for (const propertyName of propertyNames) {
+                try {
+                    const value = source[propertyName];
+                    if (value != null && value !== '') return value;
+                } catch (_) {}
+            }
+        }
+        return null;
+    }
+
+    function extractCharacterSummaryFromRuntimeModel(model, path, slot) {
+        if (!isObject(model)) return null;
+        const stats = {};
+        const matchedPaths = {};
+        collectCharacterSummaryMethodStats(model, stats, matchedPaths, path);
+        const usableStatCount = ['hp', 'atk', 'matk', 'def', 'mdef', 'spd', 'mind'].filter(function(statName) {
+            return stats[statName] != null;
+        }).length;
+        if (usableStatCount < 3) return null;
+
+        const characterCd = readUserDataValue(model, ['getCharacterCd'], ['characterCd', '_characterCd']);
+        const characterId = readUserDataValue(model, ['getCharacterId'], ['characterId', '_characterId']);
+        const name = callGetterOrNull(model, ['getName', 'getCharacterName', 'getUnitName']);
+
+        return {
+            slot,
+            name: typeof name === 'string' && name ? shortString(name, 80) : null,
+            characterCd: characterCd == null ? null : String(characterCd),
+            characterId: numberOrNull(characterId),
+            totalPower: stats.totalPower != null ? stats.totalPower : null,
+            hp: stats.hp != null ? stats.hp : null,
+            atk: stats.atk != null ? stats.atk : null,
+            matk: stats.matk != null ? stats.matk : null,
+            def: stats.def != null ? stats.def : null,
+            mdef: stats.mdef != null ? stats.mdef : null,
+            spd: stats.spd != null ? stats.spd : null,
+            mind: stats.mind != null ? stats.mind : null
+        };
+    }
+
+    function readNumberGetter(value, methodNames) {
+        const rawValue = callGetterOrNull(value, methodNames);
+        return numberOrNull(rawValue);
+    }
+
+    function readDeckCharacterContext(deck, characterCd, source) {
+        if (!isObject(deck) || typeof deck.getCharacters !== 'function' || !characterCd) return null;
+        let characters = [];
+        try { characters = deck.getCharacters(); } catch (_) { characters = []; }
+        if (!Array.isArray(characters)) return null;
+        for (const character of characters) {
+            const userData = character && character.userData;
+            const deckCharacterCd = userData && callGetterOrNull(userData, ['getCharacterCd']);
+            if (deckCharacterCd !== characterCd) continue;
+            return {
+                deckId: readNumberGetter(deck, ['getDeckId']),
+                position: readNumberGetter(character, ['getPosition']),
+                source
+            };
+        }
+        return null;
+    }
+
+    function getDeckById(DeckUtils, deckId) {
+        if (!DeckUtils || typeof DeckUtils.getDeck !== 'function' || deckId == null) return null;
+        try { return DeckUtils.getDeck(deckId); } catch (_) { return null; }
+    }
+
+    function pushDeckIdCandidate(candidates, deckId, source) {
+        const numberValue = numberOrNull(deckId);
+        if (numberValue == null) return;
+        if (candidates.some(function(candidate) { return candidate.deckId === numberValue; })) return;
+        candidates.push({ deckId: numberValue, source });
+    }
+
+    function readVisibleDeckTopWindowDeckId() {
+        try {
+            if (!window.cc || !cc.director || typeof cc.director.getScene !== 'function') return null;
+            const scene = cc.director.getScene();
+            const queue = scene ? [scene] : [];
+            const seen = new WeakSet();
+            let scanned = 0;
+            while (queue.length > 0 && scanned < 1200) {
+                const node = queue.shift();
+                if (!isObject(node) || seen.has(node)) continue;
+                seen.add(node);
+                scanned += 1;
+                if (getNodeName(node) === 'DeckTopWindow' && node.activeInHierarchy !== false) {
+                    const components = getNodeComponents(node);
+                    for (const component of components) {
+                        const deckId = component && numberOrNull(component._deckId);
+                        if (deckId != null) return deckId;
+                    }
+                }
+                const children = getNodeChildren(node);
+                for (const child of children) queue.push(child);
+            }
+        } catch (_) {}
+        return null;
+    }
+
+    function collectSceneTransitionItems(req) {
+        const transitions = [];
+        try {
+            const Singleton = req('Singleton');
+            const SingletonConst = req('SingletonConst');
+            const sceneManager = Singleton && SingletonConst && Singleton[SingletonConst.SCENE_MANAGER];
+            const currentTransition = sceneManager && typeof sceneManager.getTransitionData === 'function'
+                ? sceneManager.getTransitionData()
+                : null;
+            if (currentTransition) transitions.push({ transition: currentTransition, source: 'current-transition' });
+            const stack = sceneManager && Array.isArray(sceneManager._stack) ? sceneManager._stack : [];
+            for (let i = stack.length - 1; i >= 0; i -= 1) {
+                transitions.push({ transition: stack[i], source: 'history-transition' });
+            }
+        } catch (_) {}
+        return transitions;
+    }
+
+    function collectPreferredDeckIdCandidates(req) {
+        const candidates = [];
+        pushDeckIdCandidate(candidates, readVisibleDeckTopWindowDeckId(), 'visible-deck-window');
+        try {
+            for (const item of collectSceneTransitionItems(req)) {
+                const parameter = item.transition && item.transition.parameter;
+                if (!parameter || typeof parameter !== 'object') continue;
+                pushDeckIdCandidate(candidates, parameter.deckId, item.source);
+            }
+        } catch (_) {}
+        try {
+            const monitorState = window.__cscCharacterStatusMonitor;
+            const lastDeckEquipmentUpdate = monitorState && monitorState.lastDeckEquipmentUpdate;
+            if (lastDeckEquipmentUpdate) {
+                pushDeckIdCandidate(candidates, lastDeckEquipmentUpdate.deckId, 'last-deck-equipment-update');
+            }
+        } catch (_) {}
+        return candidates;
+    }
+
+    function findDeckCharacterContext(DeckUtils, characterCd, preferredDeckIds) {
+        if (!DeckUtils || !characterCd) return null;
+        for (const preferred of preferredDeckIds || []) {
+            const deck = getDeckById(DeckUtils, preferred.deckId);
+            const context = readDeckCharacterContext(deck, characterCd, preferred.source);
+            if (context) return context;
+        }
+        return null;
+    }
+
+    function getPreferredDeckModelSummaries(req) {
+        try {
+            if (typeof req !== 'function') return { summaries: [] };
+
+            const DeckUtils = req('DeckUtils');
+            const GameConst = req('GameConst');
+            if (!DeckUtils || typeof DeckUtils.getDeck !== 'function') return { summaries: [] };
+
+            const preferredDeckIds = collectPreferredDeckIdCandidates(req);
+            for (const preferred of preferredDeckIds) {
+                const deck = getDeckById(DeckUtils, preferred.deckId);
+                if (!deck || typeof deck.getCharacters !== 'function') continue;
+
+                let characters = [];
+                try { characters = deck.getCharacters(); } catch (_) { characters = []; }
+                if (!Array.isArray(characters)) continue;
+
+                const maxCount = numberOrNull(GameConst && GameConst.ORGANIZE_CHARACTER_MAX_COUNT) || 5;
+                let positionedCharacters = [];
+                try {
+                    positionedCharacters = typeof DeckUtils.getCharactersByPosition === 'function'
+                        ? DeckUtils.getCharactersByPosition(characters)
+                        : [];
+                } catch (_) {
+                    positionedCharacters = [];
+                }
+                if (!Array.isArray(positionedCharacters) || positionedCharacters.length === 0) {
+                    positionedCharacters = [];
+                    for (let position = 1; position <= maxCount; position += 1) {
+                        positionedCharacters.push(characters.find(function(character) {
+                            return readNumberGetter(character, ['getPosition']) === position;
+                        }) || null);
+                    }
+                }
+
+                const summaries = [];
+                for (let i = 0; i < Math.min(positionedCharacters.length, maxCount); i += 1) {
+                    const character = positionedCharacters[i];
+                    const slot = i + 1;
+                    if (!character) {
+                        summaries.push({ slot, name: null, characterCd: null, characterId: null, source: { nodeName: 'DeckUtils', deckId: preferred.deckId, deckContextSource: preferred.source } });
+                        continue;
+                    }
+                    const summary = extractCharacterSummaryFromRuntimeModel(
+                        character,
+                        'DeckUtils.getDeck(' + preferred.deckId + ').getCharacters()[' + i + ']',
+                        slot
+                    );
+                    if (!summary) continue;
+                    if (!summary.name && character.mainMaster) {
+                        const name = callGetterOrNull(character.mainMaster, ['getName']);
+                        if (typeof name === 'string' && name) summary.name = shortString(name, 80);
+                    }
+                    if (!summary.name && !summary.characterCd) {
+                        summaries.push({ slot, name: null, characterCd: null, characterId: null, source: { nodeName: 'DeckUtils', deckId: preferred.deckId, deckContextSource: preferred.source } });
+                        continue;
+                    }
+                    summary.slot = slot;
+                    summary.source = {
+                        nodeName: 'DeckUtils',
+                        deckId: preferred.deckId,
+                        deckContextSource: preferred.source
+                    };
+                    summaries.push(summary);
+                }
+
+                const filledCount = summaries.filter(function(summary) {
+                    return summary && (summary.characterCd || summary.name);
+                }).length;
+                const emptySlotCount = summaries.filter(function(summary) {
+                    return summary && !summary.characterCd && !summary.name;
+                }).length;
+                if (filledCount === 0 && emptySlotCount === 0) continue;
+
+                return { summaries };
+            }
+
+            return { summaries: [] };
+        } catch (_) {
+            return { summaries: [] };
+        }
+    }
+
+    function createAwakeEquipmentOnlyContext(characterCd) {
+        return {
+            deckId: 0,
+            position: 1,
+            source: 'awake-equipment-only',
+            characterCd
+        };
+    }
+
+    function createDeckCharacterModel(DeckCharacterModel, userData, deckContext, updateCharacter, GameConst) {
+        if (deckContext && deckContext.source !== 'awake-equipment-only') {
+            return new DeckCharacterModel({
+                deckId: deckContext.deckId,
+                position: deckContext.position || 0,
+                userData
+            });
+        }
+
+        const characterCd = updateCharacter && updateCharacter.characterCd
+            ? String(updateCharacter.characterCd)
+            : callGetterOrNull(userData, ['getCharacterCd']);
+        const awakePosition = numberOrNull(GameConst && GameConst.AWAKE_EQUIPMENT_POSITION) || 3;
+        const isAwakening = updateCharacter
+            ? !!updateCharacter.isAwakening
+            : numberOrNull(callGetterOrNull(userData, ['getIsAwakening'])) === 1;
+        const deckEquipments = isAwakening
+            ? [{ _id: characterCd, characterCd, position: awakePosition }]
+            : [];
+        return new DeckCharacterModel({
+            isImmutable: true,
+            deckId: 0,
+            position: 0,
+            userData,
+            deckEquipments,
+            getDeckCharactersPassives: function() { return {}; },
+            getDeckSummonPassives: function() { return []; }
+        });
+    }
+
+    function summarizeDeckCharacterModel(model, lastEnabledTree, deckContext) {
+        if (!isObject(model)) return null;
+        const stats = {
+            totalPower: readNumberGetter(model, ['getTotalStatusWithEquip']),
+            hp: readNumberGetter(model, ['getHpWithEquip']),
+            atk: readNumberGetter(model, ['getAtkPhysicsWithEquip']),
+            matk: readNumberGetter(model, ['getAtkMagicWithEquip']),
+            def: readNumberGetter(model, ['getDefPhysicsWithEquip']),
+            mdef: readNumberGetter(model, ['getDefMagicWithEquip']),
+            spd: readNumberGetter(model, ['getSpdWithEquip']),
+            mind: readNumberGetter(model, ['getMindWithEquip'])
+        };
+        const usableStatCount = ['hp', 'atk', 'matk', 'def', 'mdef', 'spd', 'mind'].filter(function(statName) {
+            return stats[statName] != null;
+        }).length;
+        if (usableStatCount < 3) return null;
+
+        const mainMaster = model.mainMaster;
+        const name = mainMaster && callGetterOrNull(mainMaster, ['getName']);
+        return {
+            slot: deckContext && deckContext.position != null ? deckContext.position : 1,
+            name: typeof name === 'string' && name ? shortString(name, 80) : null,
+            characterCd: lastEnabledTree.characterCd == null ? null : String(lastEnabledTree.characterCd),
+            characterId: numberOrNull(lastEnabledTree.characterId),
+            totalPower: stats.totalPower,
+            hp: stats.hp,
+            atk: stats.atk,
+            matk: stats.matk,
+            def: stats.def,
+            mdef: stats.mdef,
+            spd: stats.spd,
+            mind: stats.mind,
+            source: {
+                nodeName: 'enabledTree',
+                path: 'window.__cscCharacterStatusMonitor.lastEnabledTree',
+                deckId: deckContext && deckContext.deckId != null ? deckContext.deckId : null,
+                position: deckContext && deckContext.position != null ? deckContext.position : null,
+                deckContextSource: deckContext && deckContext.source ? deckContext.source : null
+            }
+        };
+    }
+
+    function readCharacterCdFromTransitionParameter(parameter, CharacterUtils) {
+        if (!parameter || typeof parameter !== 'object') return null;
+        const direct = parameter.characterCd || parameter.unitCd || parameter.selectUnitCd || parameter._characterCd || parameter._unitCd || parameter._selectUnitCd;
+        if (direct != null && direct !== '') return String(direct);
+
+        const characterId = numberOrNull(parameter.characterId || parameter._characterId);
+        if (characterId != null && CharacterUtils && typeof CharacterUtils.getUserCharacterByCharacterId === 'function') {
+            try {
+                const userData = CharacterUtils.getUserCharacterByCharacterId(characterId);
+                const characterCd = callGetterOrNull(userData, ['getCharacterCd']);
+                if (characterCd != null && characterCd !== '') return String(characterCd);
+            } catch (_) {}
+        }
+        if (characterId != null && CharacterUtils && typeof CharacterUtils.getCharacterByCharacterId === 'function') {
+            try {
+                const character = CharacterUtils.getCharacterByCharacterId(characterId);
+                const characterCd = readUserDataValue(character, ['getCharacterCd'], ['characterCd', '_characterCd']);
+                if (characterCd != null && characterCd !== '') return String(characterCd);
+            } catch (_) {}
+        }
+
+        const nestedValues = [parameter.userData, parameter.character, parameter.characterModel, parameter.model, parameter.unit];
+        for (const nested of nestedValues) {
+            const characterCd = readUserDataValue(nested, ['getCharacterCd'], ['characterCd', '_characterCd']);
+            if (characterCd != null && characterCd !== '') return String(characterCd);
+        }
+        return null;
+    }
+
+    function isInventoryAbilityTransitionParameter(parameter) {
+        if (!parameter || typeof parameter !== 'object') return false;
+        return !!(
+            parameter.unitCd ||
+            parameter._unitCd ||
+            parameter.selectUnitCd ||
+            parameter._selectUnitCd
+        );
+    }
+
+    function readCurrentAbilityPanelCharacter(req) {
+        const result = {
+            characterCd: null,
+            characterId: null,
+            userData: null,
+            source: null,
+            isInventoryAbilityContext: false
+        };
+        try {
+            if (typeof req !== 'function') return result;
+            const CharacterUtils = req('CharacterUtils');
+            for (const item of collectSceneTransitionItems(req)) {
+                if (item.source !== 'current-transition') continue;
+                const parameter = item.transition && item.transition.parameter;
+                const characterCd = readCharacterCdFromTransitionParameter(parameter, CharacterUtils);
+                if (!characterCd) continue;
+                result.characterCd = characterCd;
+                result.characterId = numberOrNull(parameter && (parameter.characterId || parameter._characterId));
+                result.source = item.source;
+                result.isInventoryAbilityContext = isInventoryAbilityTransitionParameter(parameter);
+                if (CharacterUtils && typeof CharacterUtils.getUserCharacter === 'function') {
+                    try { result.userData = CharacterUtils.getUserCharacter(characterCd); } catch (_) { result.userData = null; }
+                }
+                if (!result.userData && CharacterUtils && typeof CharacterUtils.getCharacter === 'function') {
+                    try {
+                        const character = CharacterUtils.getCharacter(characterCd);
+                        result.userData = character && character.userData ? character.userData : null;
+                    } catch (_) { result.userData = null; }
+                }
+                if (result.characterId == null) {
+                    result.characterId = numberOrNull(callGetterOrNull(result.userData, ['getCharacterId']));
+                }
+                return result;
+            }
+        } catch (_) {}
+        return result;
+    }
+
+    function extractAbilityPanelCharacterSummary() {
+        try {
+            const monitorState = window.__cscCharacterStatusMonitor;
+            const lastEnabledTree = monitorState && monitorState.lastEnabledTree;
+            const updateCharacter = lastEnabledTree && lastEnabledTree.updateCharacter;
+
+            const req = window.__require;
+            if (typeof req !== 'function') return { summary: null };
+
+            const UserCharacterModel = req('UserCharacterModel');
+            const DeckCharacterModel = req('DeckCharacterModel');
+            const DeckUtils = req('DeckUtils');
+            const GameConst = req('GameConst');
+            const currentAbilityPanelCharacter = readCurrentAbilityPanelCharacter(req);
+            const lastEnabledTreeCharacterCd = lastEnabledTree && lastEnabledTree.characterCd != null ? String(lastEnabledTree.characterCd) : null;
+            const characterCd = currentAbilityPanelCharacter.characterCd || lastEnabledTreeCharacterCd;
+            if (!currentAbilityPanelCharacter.characterCd && lastEnabledTreeCharacterCd) {
+                return { summary: null };
+            }
+            if (!characterCd) return { summary: null };
+            if (typeof UserCharacterModel !== 'function' || typeof DeckCharacterModel !== 'function') return { summary: null };
+
+            const preferredDeckIds = collectPreferredDeckIdCandidates(req);
+            const deckContext = currentAbilityPanelCharacter.isInventoryAbilityContext
+                ? createAwakeEquipmentOnlyContext(characterCd)
+                : findDeckCharacterContext(DeckUtils, characterCd, preferredDeckIds) || createAwakeEquipmentOnlyContext(characterCd);
+            if (!deckContext) return { summary: null };
+
+            const canUseLastEnabledTree = updateCharacter && typeof updateCharacter === 'object' && lastEnabledTreeCharacterCd === characterCd;
+            const userData = canUseLastEnabledTree
+                ? new UserCharacterModel(updateCharacter)
+                : currentAbilityPanelCharacter.userData;
+            if (!userData) return { summary: null };
+            const summaryIdentity = {
+                characterCd,
+                characterId: currentAbilityPanelCharacter.characterId != null
+                    ? currentAbilityPanelCharacter.characterId
+                    : numberOrNull(lastEnabledTree && lastEnabledTree.characterId)
+            };
+            const deckCharacter = createDeckCharacterModel(DeckCharacterModel, userData, deckContext, canUseLastEnabledTree ? updateCharacter : null, GameConst);
+            const summary = summarizeDeckCharacterModel(deckCharacter, summaryIdentity, deckContext);
+            if (!summary) return { summary: null };
+
+            return { summary };
+        } catch (_) {
+            return { summary: null };
+        }
+    }
+
+    function dedupeCharacterSummaries(summaries) {
+        return (summaries || []).filter(function(summary, index, list) {
+            return index === list.findIndex(function(other) {
+                if (summary.characterCd && other.characterCd) return other.characterCd === summary.characterCd;
+                if (summary.characterId != null && other.characterId != null) return other.characterId === summary.characterId;
+                return other.slot === summary.slot;
+            });
+        });
+    }
+
+    function getFieldValue(fields, key) {
+        if (!Array.isArray(fields)) return undefined;
+        for (const field of fields) {
+            if (field && field.key === key) return field.value;
+        }
+        return undefined;
+    }
+
+    function extractStatsFromComponentFields(componentFields, basePath) {
+        const stats = {};
+        const matchedStatPaths = {};
+        for (const field of componentFields || []) {
+            if (!field) continue;
+            if (field.key === '_character' && Array.isArray(field.fields)) {
+                for (const nestedField of field.fields) {
+                    if (!nestedField) continue;
+                    const statName = summaryAliasToStat[normalizeKey(nestedField.key)];
+                    if (!statName) continue;
+                    const numberValue = numberOrNull(nestedField.value);
+                    if (numberValue == null || stats[statName] != null) continue;
+                    stats[statName] = numberValue;
+                    matchedStatPaths[statName] = basePath + '._character.' + nestedField.key;
+                }
+            }
+
+            const statName = summaryAliasToStat[normalizeKey(field.key)];
+            if (!statName || stats[statName] != null) continue;
+            const numberValue = numberOrNull(field.value);
+            if (numberValue == null) continue;
+            stats[statName] = numberValue;
+            matchedStatPaths[statName] = basePath + '.' + field.key;
+        }
+        return { stats, matchedStatPaths };
+    }
+
+    function findCharacterNameForPath(labels, nodePath) {
+        const sourceLabels = Array.isArray(labels) ? labels : [];
+        for (const label of sourceLabels) {
+            if (!label || !label.nodePath || !label.text) continue;
+            if (label.nodeName !== 'CharacterNameLabel') continue;
+            if (String(label.nodePath).indexOf(nodePath) !== 0) continue;
+            return shortString(label.text, 80);
+        }
+        return null;
+    }
+
+    function findLabelTextUnderNode(node) {
+        const queue = [{ node, depth: 0 }];
+        const seen = new WeakSet();
+        while (queue.length > 0) {
+            const item = queue.shift();
+            if (!isObject(item.node) || seen.has(item.node) || item.depth > 5) continue;
+            seen.add(item.node);
+
+            if (getNodeName(item.node) === 'CharacterNameLabel') {
+                const components = getNodeComponents(item.node);
+                for (let i = 0; i < components.length; i += 1) {
+                    const label = readComponentLabel(components[i]);
+                    if (label) return label;
+                }
+            }
+
+            const children = getNodeChildren(item.node);
+            for (let i = 0; i < children.length; i += 1) {
+                queue.push({ node: children[i], depth: item.depth + 1 });
+            }
+        }
+        return null;
+    }
+
+    function extractDeckCharacterSummaries(componentDataSamples, labels) {
+        const summaries = [];
+        const samples = Array.isArray(componentDataSamples) ? componentDataSamples : [];
+        for (const sample of samples) {
+            if (!sample || !sample.path || sample.nodeName == null) continue;
+            const nodeName = String(sample.nodeName);
+            if (!/^DeckCharacter#\\d+$/i.test(nodeName)) continue;
+
+            const match = nodeName.match(/#(\\d+)/);
+            const slot = match ? Number(match[1]) : null;
+            const nodePath = String(sample.path).replace(/\\.components\\[\\d+\\]$/, '');
+            const statsResult = extractStatsFromComponentFields(sample.fields, sample.path);
+            const characterCd = getFieldValue(sample.fields, '_characterCd');
+            const name = findCharacterNameForPath(labels, nodePath);
+
+            summaries.push({
+                slot,
+                name,
+                characterCd: characterCd == null ? null : String(characterCd),
+                totalPower: statsResult.stats.totalPower != null ? statsResult.stats.totalPower : null,
+                hp: statsResult.stats.hp != null ? statsResult.stats.hp : null,
+                atk: statsResult.stats.atk != null ? statsResult.stats.atk : null,
+                matk: statsResult.stats.matk != null ? statsResult.stats.matk : null,
+                def: statsResult.stats.def != null ? statsResult.stats.def : null,
+                mdef: statsResult.stats.mdef != null ? statsResult.stats.mdef : null,
+                spd: statsResult.stats.spd != null ? statsResult.stats.spd : null,
+                mind: statsResult.stats.mind != null ? statsResult.stats.mind : null
+            });
+        }
+
+        return summaries
+            .sort(function(a, b) { return (a.slot || 0) - (b.slot || 0); })
+            .filter(function(summary, index, list) {
+                return index === list.findIndex(function(other) {
+                    return other.slot === summary.slot && other.characterCd === summary.characterCd;
+                });
+            });
+    }
+
+    function extractDeckCharacterSummariesFromLayers(layerSummaries) {
+        const samples = [];
+        const labels = [];
+        for (const layer of layerSummaries || []) {
+            if (!layer || !layer.visibility || layer.visibility.visible === false) continue;
+            if (String(layer.name || '').indexOf('DeckCharacterListLayer') === -1) continue;
+            if (Array.isArray(layer.componentDataSamples)) {
+                for (const sample of layer.componentDataSamples) samples.push(sample);
+            }
+            if (Array.isArray(layer.labels)) {
+                for (const label of layer.labels) labels.push(label);
+            }
+        }
+        return extractDeckCharacterSummaries(samples, labels);
+    }
+
+    function extractDeckCharacterSummariesFromLayerNodes(targetLayers) {
+        const summaries = [];
+        for (const layer of targetLayers || []) {
+            if (!layer || !layer.node || !layer.visibility || layer.visibility.visible === false) continue;
+            if (String(layer.name || '').indexOf('DeckCharacterListLayer') === -1) continue;
+
+            const queue = [{ node: layer.node, path: layer.path, depth: 0 }];
+            const seen = new WeakSet();
+            while (queue.length > 0) {
+                const item = queue.shift();
+                if (!isObject(item.node) || seen.has(item.node) || item.depth > 8) continue;
+                seen.add(item.node);
+
+                const nodeName = getNodeName(item.node);
+                if (/^DeckCharacter#\\d+$/i.test(nodeName)) {
+                    const component = getFirstComponent(item.node);
+                    const character = component && (component._character || component.character);
+                    const stats = {};
+                    const matchedStatPaths = {};
+                    if (character) {
+                        collectCharacterSummaryMethodStats(character, stats, matchedStatPaths, item.path + '.components[0]._character');
+                        collectCharacterSummaryStats(character, stats, matchedStatPaths, item.path + '.components[0]._character', 0);
+                    }
+                    if (component) {
+                        collectCharacterSummaryStats(component, stats, matchedStatPaths, item.path + '.components[0]', 0);
+                    }
+                    const slotMatch = nodeName.match(/#(\\d+)/);
+                    const characterCd = component && (component._characterCd || component.characterCd);
+
+                    summaries.push({
+                        slot: slotMatch ? Number(slotMatch[1]) : summaries.length + 1,
+                        name: findLabelTextUnderNode(item.node),
+                        characterCd: characterCd == null ? null : String(characterCd),
+                        totalPower: stats.totalPower != null ? stats.totalPower : null,
+                        hp: stats.hp != null ? stats.hp : null,
+                        atk: stats.atk != null ? stats.atk : null,
+                        matk: stats.matk != null ? stats.matk : null,
+                        def: stats.def != null ? stats.def : null,
+                        mdef: stats.mdef != null ? stats.mdef : null,
+                        spd: stats.spd != null ? stats.spd : null,
+                        mind: stats.mind != null ? stats.mind : null
+                    });
+                    continue;
+                }
+
+                const children = getNodeChildren(item.node);
+                for (let i = 0; i < children.length; i += 1) {
+                    const child = children[i];
+                    if (!isObject(child)) continue;
+                    const childName = getNodeName(child) || String(i);
+                    queue.push({
+                        node: child,
+                        path: item.path + '.children[' + i + ':' + shortString(childName, 30) + ']',
+                        depth: item.depth + 1
+                    });
+                }
+            }
+        }
+
+        return summaries
+            .sort(function(a, b) { return (a.slot || 0) - (b.slot || 0); })
+            .filter(function(summary, index, list) {
+                return index === list.findIndex(function(other) {
+                    return other.slot === summary.slot && other.characterCd === summary.characterCd;
+                });
+            });
+    }
+
+    function isUsableLayerCharacterSummary(summary) {
+        if (!summary || typeof summary !== 'object') return false;
+        if (!summary.name && !summary.characterCd) return false;
+        const statCount = CHARACTER_SUMMARY_CORE_STATS.filter(function(statName) {
+            return summary[statName] != null;
+        }).length;
+        return statCount >= 3;
+    }
+
+    function filterUsableLayerCharacterSummaries(summaries) {
+        return (summaries || []).filter(isUsableLayerCharacterSummary);
+    }
+
+    function summarize(value, path, depth) {
+        const statResult = collectStats(value);
+        const statCount = Object.keys(statResult.stats).length;
+        if (statCount < 2) return null;
+
+        const labels = readLabel(value);
+        const ctor = constructorName(value);
+        let score = statCount * 10;
+        if (labels.name || labels._name || labels.unitName || labels.characterName || labels.charaName) score += 6;
+        if (labels.id || labels.unitId || labels.characterId || labels.charaId || labels.characterMainId) score += 4;
+        if (statResult.stats.spd != null) score += 3;
+        if (/status|unit|character|chara|awake|deck|detail/i.test(path)) score += 3;
+
+        return {
+            score,
+            path,
+            depth,
+            constructor: ctor,
+            labels,
+            stats: statResult.stats,
+            matchedKeys: statResult.matchedKeys
+        };
+    }
+
+    function enqueue(queue, value, path, depth) {
+        if (!isObject(value)) return;
+        queue.push({ value, path, depth });
+    }
+
+    const roots = [];
+    let scene = null;
+    try {
+        if (window.cc && cc.director && typeof cc.director.getScene === 'function') {
+            scene = cc.director.getScene();
+            enqueue(roots, scene, 'cc.director.getScene()', 0);
+        }
+    } catch (_) {}
+    try { enqueue(roots, window.nw && window.nw.global, 'window.nw.global', 0); } catch (_) {}
+    try { enqueue(roots, window.__cscBridge, 'window.__cscBridge', 0); } catch (_) {}
+
+    const queue = roots.slice();
+    const seen = new WeakSet();
+    const candidates = [];
+    const cocos = scene
+        ? collectCocosLabels(scene, 'cc.director.getScene()', MAX_COCOS_NODES, MAX_LABELS, true)
+        : { labels: [], componentDataSamples: [], targetLayers: [] };
+    const statusGroupCandidates = buildStatusGroupCandidates(cocos.labels);
+    const layerSummaries = collectLayerSummaries(cocos.targetLayers);
+    const layerCharacterSummaries = extractDeckCharacterSummariesFromLayers(layerSummaries);
+    const nodeCharacterSummaries = extractDeckCharacterSummariesFromLayerNodes(cocos.targetLayers);
+    const rawDeckCharacterSummaries = nodeCharacterSummaries.length > 0 ? nodeCharacterSummaries : layerCharacterSummaries;
+    const deckCharacterSummaries = filterUsableLayerCharacterSummaries(rawDeckCharacterSummaries);
+    const preferredDeckModelSummaries = getPreferredDeckModelSummaries(window.__require);
+    const modelCharacterSummaries = [];
+    let characterSummaries = [];
+    let characterSummariesSource = null;
+    for (const statusGroupCandidate of statusGroupCandidates) candidates.push(statusGroupCandidate);
+    const labelStatusCandidate = buildLabelStatusCandidate(cocos.labels);
+    if (labelStatusCandidate) {
+        const values = Object.values(labelStatusCandidate.stats || {});
+        const hasNonZero = values.some(function(value) { return value !== 0; });
+        if (!hasNonZero) labelStatusCandidate.score -= 50;
+        candidates.push(labelStatusCandidate);
+    }
+    let scanned = 0;
+
+    while (queue.length > 0 && scanned < MAX_NODES) {
+        const item = queue.shift();
+        const value = item.value;
+        if (!isObject(value)) continue;
+        if (seen.has(value)) continue;
+        seen.add(value);
+        scanned += 1;
+
+        const candidate = summarize(value, item.path, item.depth);
+        if (candidate) candidates.push(candidate);
+
+        const modelSummary = extractCharacterSummaryFromRuntimeModel(
+            value,
+            item.path,
+            modelCharacterSummaries.length + 1
+        );
+        if (modelSummary) modelCharacterSummaries.push(modelSummary);
+
+        if (item.depth >= MAX_DEPTH) continue;
+        const entries = safeOwnEntries(value);
+        for (const [key, child] of entries) {
+            if (!isObject(child)) continue;
+            if (key === 'window' || key === 'document' || key === 'globalThis') continue;
+            if (key === 'masterData') continue;
+            enqueue(queue, child, item.path + '.' + key, item.depth + 1);
+        }
+
+        if (item.path === 'cc.director.getScene()' || item.path.indexOf('.children[') !== -1) {
+            const components = getNodeComponents(value);
+            for (let i = 0; i < components.length; i += 1) {
+                enqueue(queue, components[i], item.path + '.components[' + i + ']', item.depth + 1);
+            }
+            const children = getNodeChildren(value);
+            for (let i = 0; i < children.length; i += 1) {
+                enqueue(queue, children[i], item.path + '.children[' + i + ']', item.depth + 1);
+            }
+        }
+    }
+
+    const dedupedModelCharacterSummaries = dedupeCharacterSummaries(modelCharacterSummaries);
+    const abilityPanelCharacterSummary = extractAbilityPanelCharacterSummary();
+    if (preferredDeckModelSummaries.summaries.length > 0) {
+        characterSummaries = preferredDeckModelSummaries.summaries;
+        characterSummariesSource = 'deck-model';
+    }
+    if (characterSummaries.length === 0 && deckCharacterSummaries.length > 0) {
+        characterSummaries = deckCharacterSummaries;
+        characterSummariesSource = 'deck-character-list';
+    }
+    if (characterSummaries.length === 0 && abilityPanelCharacterSummary.summary) {
+        characterSummaries = [abilityPanelCharacterSummary.summary];
+        characterSummariesSource = 'ability-panel-enabled-tree';
+    }
+    if (characterSummaries.length === 0 && dedupedModelCharacterSummaries.length > 0) {
+        characterSummaries = dedupedModelCharacterSummaries;
+        characterSummariesSource = 'runtime-character-model';
+    }
+
+    candidates.sort(function(a, b) { return b.score - a.score; });
+    const topCandidates = candidates.slice(0, MAX_CANDIDATES);
+    const best = topCandidates[0] || null;
+    function candidateHasUsableStatus(candidate) {
+        if (!candidate || !candidate.stats) return false;
+        const values = Object.values(candidate.stats);
+        if (values.length < 3) return false;
+        if (values.every(function(value) { return value === 0; })) return false;
+        if (candidate.constructor === 'CocosStatusGroup' && candidate.visibleLabelCount === 0) return false;
+        if (candidate.path === 'cocos-label-sequence') return values.some(function(value) { return value !== 0; });
+        return true;
+    }
+
+    const hasUsableStatus = characterSummaries.length > 0 || candidateHasUsableStatus(best);
+
+    const snapshot = hasUsableStatus
+        ? {
+            ok: true,
+            error: null,
+            source: characterSummariesSource,
+            capturedAt: nowIso(),
+            characterSummaries
+        }
+        : {
+            ok: false,
+            error: 'NO_CHARACTER_STATUS_DETECTED',
+            capturedAt: nowIso(),
+            characterSummaries: [],
+            reason: best && best.path === 'cocos-label-sequence'
+                ? 'Fallback label detector only found hidden zero-value summon status labels.'
+                : 'No usable visible character status source was extracted.'
+        };
+
+    return JSON.stringify(snapshot);
+})()
+`;
+
+async function readCharacterStatusProbeSnapshot() {
+    const rawResult = await evaluateAutomationScript(
+        CHARACTER_STATUS_PROBE_SOURCE,
+        hasMainWindow() ? mainWindow : null
+    );
+    if (typeof rawResult !== 'string' || !rawResult.trim()) {
+        return {
+            ok: false,
+            error: 'EMPTY_PROBE_RESULT',
+            capturedAt: new Date().toISOString()
+        };
+    }
+
+    if (rawResult.startsWith('Error:')) {
+        return {
+            ok: false,
+            error: 'PROBE_EXECUTION_FAILED',
+            message: rawResult,
+            capturedAt: new Date().toISOString()
+        };
+    }
+
+    try {
+        return JSON.parse(rawResult);
+    } catch (error) {
+        return {
+            ok: false,
+            error: 'PROBE_RESULT_PARSE_FAILED',
+            message: error?.message || String(error),
+            raw: rawResult.slice(0, 2000),
+            capturedAt: new Date().toISOString()
+        };
+    }
+}
+
+function numberOrNull(value) {
+    if (value == null || value === '') return null;
+    const numberValue = Number(value);
+    return Number.isFinite(numberValue) ? numberValue : null;
+}
+
+function normalizeCharacterStatusSummary(summary) {
+    if (!summary || typeof summary !== 'object') return null;
+    const slot = numberOrNull(summary.slot);
+    const rawName = typeof summary.name === 'string' && summary.name ? summary.name : null;
+    const name = rawName && !/^unknown character$/i.test(rawName.trim()) ? rawName : null;
+    const characterCd = typeof summary.characterCd === 'string' && summary.characterCd ? summary.characterCd : null;
+    const characterId = numberOrNull(summary.characterId);
+    const isEmptySlot = !name && !characterCd;
+    if (isEmptySlot) {
+        return {
+            slot,
+            name: null,
+            characterCd: null,
+            characterId: null,
+            isEmptySlot: true,
+            totalPower: null,
+            hp: null,
+            atk: null,
+            matk: null,
+            def: null,
+            mdef: null,
+            spd: null,
+            mind: null
+        };
+    }
+
+    return {
+        slot,
+        name,
+        characterCd,
+        characterId,
+        isEmptySlot: false,
+        deckContextSource: typeof summary.source?.deckContextSource === 'string' ? summary.source.deckContextSource : null,
+        totalPower: numberOrNull(summary.totalPower),
+        hp: numberOrNull(summary.hp),
+        atk: numberOrNull(summary.atk),
+        matk: numberOrNull(summary.matk),
+        def: numberOrNull(summary.def),
+        mdef: numberOrNull(summary.mdef),
+        spd: numberOrNull(summary.spd),
+        mind: numberOrNull(summary.mind)
+    };
+}
+
+function normalizeCharacterStatusMonitorSnapshot(snapshot) {
+    const capturedAt = typeof snapshot?.capturedAt === 'string'
+        ? snapshot.capturedAt
+        : new Date().toISOString();
+    const summaries = Array.isArray(snapshot?.characterSummaries)
+        ? snapshot.characterSummaries
+        : [];
+    const characters = summaries
+        .map(normalizeCharacterStatusSummary)
+        .filter(Boolean);
+
+    if (snapshot?.ok && characters.length > 0) {
+        return {
+            schemaVersion: 1,
+            ok: true,
+            error: null,
+            source: typeof snapshot.source === 'string' && snapshot.source ? snapshot.source : 'deck-character-list',
+            capturedAt,
+            characters
+        };
+    }
+
+    const normalized = {
+        schemaVersion: 1,
+        ok: false,
+        error: typeof snapshot?.error === 'string' && snapshot.error
+            ? snapshot.error
+            : 'NO_CHARACTER_STATUS_DETECTED',
+        source: null,
+        capturedAt,
+        characters: []
+    };
+    if (typeof snapshot?.reason === 'string' && snapshot.reason) normalized.reason = snapshot.reason;
+    return normalized;
+}
+
+function createCharacterStatusMonitorForbiddenSnapshot() {
+    return {
+        schemaVersion: 1,
+        ok: false,
+        error: 'FORBIDDEN_SNAPSHOT_SENDER',
+        source: null,
+        capturedAt: new Date().toISOString(),
+        characters: [],
+        reason: 'Character status monitor snapshots can only be requested by the monitor window.'
+    };
+}
+
+function isCharacterStatusMonitorSender(event) {
+    const sender = event?.sender;
+    if (!sender || !characterStatusMonitorWin || characterStatusMonitorWin.isDestroyed()) return false;
+    if (sender !== characterStatusMonitorWin.webContents) return false;
+    try {
+        return /character-status-monitor\.html(?:[?#]|$)/i.test(sender.getURL());
+    } catch (_) {
+        return false;
+    }
+}
+
+async function readCharacterStatusMonitorSnapshot() {
+    try {
+        const snapshot = await readCharacterStatusProbeSnapshot();
+        return normalizeCharacterStatusMonitorSnapshot(snapshot);
+    } catch (error) {
+        return {
+            schemaVersion: 1,
+            ok: false,
+            error: 'CHARACTER_STATUS_SNAPSHOT_FAILED',
+            source: null,
+            capturedAt: new Date().toISOString(),
+            characters: [],
+            message: error?.message || String(error)
+        };
+    }
+}
 function stopAutomationServer() {
     if (!automationServer) return;
     const serverRef = automationServer;
@@ -2941,7 +4613,7 @@ app.whenReady().then(async () => {
     }
 
     createWindow();
-    (function setupMasterDataAutoCapture() {
+    setupMasterDataAutoCapture = function() {
         // DMM/Fanza ships master data as zlib-compressed protobuf .bin files,
         // decodable only with the game's own pbjs decoders (closure-scoped in
         // index.js's IIFE, not on window). We auto-attach to OOPIFs, enable
@@ -2952,20 +4624,56 @@ app.whenReady().then(async () => {
         // pause is microseconds and invisible to the user; from then on the
         // iframe can decode any of the 430 master data tables on demand.
         if (!mainWindow || !mainWindow.webContents) { console.warn('[CSC-CDP] no mainWindow, abort'); return; }
-        const dbg = mainWindow.webContents.debugger;
-        try {
-            dbg.attach('1.3');
-            console.log('[CSC-CDP] debugger attached OK');
-        } catch (e) {
-            console.warn('[CSC-CDP] attach FAILED:', e && e.message || e); return;
-        }
-
-        dbg.sendCommand('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true })
-            .catch((e) => console.warn('[CSC-CDP] Target.setAutoAttach FAILED:', e && e.message || e));
-
-        const _armedScripts = new Set(); // scriptId+sessionId already inspected
+        const targetWindow = mainWindow;
+        const targetWebContents = targetWindow.webContents;
+        const dbg = targetWebContents.debugger;
+        const _armedScripts = new Set(); // document/session/script tuple already inspected
         const _armedBreakpoints = new Map(); // bpId -> { sessionId, varName, url }
         let _pbCaptured = false;
+        let _reattachTimer = null;
+
+        function isTargetWindowActive() {
+            return mainWindow === targetWindow && !targetWebContents.isDestroyed();
+        }
+
+        function sendCdpCommand(command, params, sessionId) {
+            if (sessionId) return dbg.sendCommand(command, params || {}, sessionId);
+            return dbg.sendCommand(command, params || {});
+        }
+
+        function enableMasterDataDebugger(reason) {
+            sendCdpCommand('Debugger.enable', {})
+                .catch((e) => console.warn('[CSC-CDP] root Debugger.enable FAILED (' + reason + '):', e && e.message || e));
+            sendCdpCommand('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true })
+                .catch((e) => console.warn('[CSC-CDP] Target.setAutoAttach FAILED (' + reason + '):', e && e.message || e));
+        }
+
+        function attachMasterDataDebugger(reason) {
+            if (!isTargetWindowActive()) return false;
+            try {
+                if (!dbg.isAttached()) {
+                    dbg.attach('1.3');
+                    console.log('[CSC-CDP] debugger attached OK' + (reason ? ' (' + reason + ')' : ''));
+                }
+            } catch (e) {
+                console.warn('[CSC-CDP] attach FAILED' + (reason ? ' (' + reason + ')' : '') + ':', e && e.message || e);
+                return false;
+            }
+            enableMasterDataDebugger(reason || 'startup');
+            return true;
+        }
+
+        function scheduleMasterDataDebuggerReattach(reason) {
+            if (_reattachTimer) clearTimeout(_reattachTimer);
+            _reattachTimer = setTimeout(() => {
+                _reattachTimer = null;
+                if (!isTargetWindowActive()) return;
+                if (targetWebContents.isDevToolsOpened()) return;
+                attachMasterDataDebugger(reason || 'reattach');
+            }, 500);
+        }
+
+        if (!attachMasterDataDebugger('startup')) return;
 
         dbg.on('message', async (event, method, params, sessionId) => {
             // Skip Debugger.enable on worker-type targets: it floods Electron with
@@ -2979,9 +4687,9 @@ app.whenReady().then(async () => {
                 const enableDebugger = targetType !== 'service_worker' && targetType !== 'shared_worker' && targetType !== 'worker';
                 if (sid) {
                     const enables = [];
-                    if (enableDebugger) enables.push(dbg.sendCommand('Debugger.enable', {}, sid).catch(() => {}));
+                    if (enableDebugger) enables.push(sendCdpCommand('Debugger.enable', {}, sid).catch(() => {}));
                     Promise.allSettled(enables).finally(() => {
-                        dbg.sendCommand('Runtime.runIfWaitingForDebugger', {}, sid)
+                        sendCdpCommand('Runtime.runIfWaitingForDebugger', {}, sid)
                             .catch((e) => console.warn('[CSC-CDP] resume FAILED session=' + sid + ':', e && e.message || e));
                     });
                 }
@@ -2995,11 +4703,12 @@ app.whenReady().then(async () => {
             if (method === 'Debugger.scriptParsed') {
                 const url = (params && params.url) || '';
                 if (!/\/index\.js(\?|$)/.test(url)) return;
-                const armKey = (sessionId || '') + ':' + params.scriptId;
+                const contextId = params.executionContextId || (params.executionContextAuxData && params.executionContextAuxData.frameId) || '';
+                const armKey = (sessionId || '') + ':' + contextId + ':' + params.scriptId + ':' + url;
                 if (_armedScripts.has(armKey)) return;
                 _armedScripts.add(armKey);
                 try {
-                    const src = await dbg.sendCommand('Debugger.getScriptSource', { scriptId: params.scriptId }, sessionId);
+                    const src = await sendCdpCommand('Debugger.getScriptSource', { scriptId: params.scriptId }, sessionId);
                     const source = src && src.scriptSource;
                     if (!source) return;
                     const match = source.match(/\bnew\s+(\w+)\.db\.UserMain\b/);
@@ -3010,7 +4719,7 @@ app.whenReady().then(async () => {
                         if (source.charCodeAt(i) === 10) { line++; col = 0; } else col++;
                     }
                     const varName = match[1];
-                    const result = await dbg.sendCommand('Debugger.setBreakpoint', {
+                    const result = await sendCdpCommand('Debugger.setBreakpoint', {
                         location: { scriptId: params.scriptId, lineNumber: line, columnNumber: col },
                         condition: 'true'
                     }, sessionId);
@@ -3033,13 +4742,13 @@ app.whenReady().then(async () => {
                 }
                 if (!info) {
                     // Not ours — resume so the game isn't stuck.
-                    dbg.sendCommand('Debugger.resume', {}, sessionId).catch(() => {});
+                    sendCdpCommand('Debugger.resume', {}, sessionId).catch(() => {});
                     return;
                 }
                 const callFrames = (params && params.callFrames) || [];
                 try {
                     if (callFrames.length > 0) {
-                        const r = await dbg.sendCommand('Debugger.evaluateOnCallFrame', {
+                        const r = await sendCdpCommand('Debugger.evaluateOnCallFrame', {
                             callFrameId: callFrames[0].callFrameId,
                             expression: 'window.__cscPb = ' + info.varName + '.db; Object.keys(window.__cscPb).length'
                         }, sessionId);
@@ -3056,22 +4765,34 @@ app.whenReady().then(async () => {
                     console.warn('[CSC-CDP] evaluateOnCallFrame failed:', e && e.message || e);
                 }
                 _armedBreakpoints.delete(bpId);
-                try { await dbg.sendCommand('Debugger.removeBreakpoint', { breakpointId: bpId }, sessionId); } catch (e) {}
-                try { await dbg.sendCommand('Debugger.resume', {}, sessionId); } catch (e) {}
-                try { dbg.detach(); } catch (e) {}
+                try { await sendCdpCommand('Debugger.removeBreakpoint', { breakpointId: bpId }, sessionId); } catch (e) {}
+                try { await sendCdpCommand('Debugger.resume', {}, sessionId); } catch (e) {}
             }
 
         });
 
-        mainWindow.webContents.on('devtools-opened', () => {
+        dbg.on('detach', (event, reason) => {
+            console.warn('[CSC-CDP] debugger detached:', reason || 'unknown');
+            _armedBreakpoints.clear();
+            if (!isTargetWindowActive()) return;
+            if (targetWebContents.isDevToolsOpened()) return;
+            scheduleMasterDataDebuggerReattach('detach');
+        });
+
+        targetWebContents.on('devtools-opened', () => {
             if (!_pbCaptured) {
-                console.log('[CSC-CDP] devtools opened before __cscPb capture; keeping debugger attached');
+                console.log('[CSC-CDP] devtools opened before __cscPb capture');
                 return;
             }
-            console.log('[CSC-CDP] devtools opened after __cscPb capture, detaching debugger');
-            try { dbg.detach(); } catch (e) {}
+            console.log('[CSC-CDP] devtools opened after __cscPb capture');
         });
-    })();
+
+        targetWebContents.on('devtools-closed', () => {
+            if (dbg.isAttached()) return;
+            scheduleMasterDataDebuggerReattach('devtools-closed');
+        });
+    };
+    setupMasterDataAutoCapture();
     if (runtimeFlags.tray) {
         createTray();
     }
@@ -3337,6 +5058,12 @@ async function runCommandDispatcher(command, payload) {
                     ok: sent,
                     command,
                     fallback: nativeCapture
+                };
+            }
+            case 'openCharacterStatusMonitor': {
+                return {
+                    ...openCharacterStatusMonitorWindow(),
+                    command
                 };
             }
             case 'downloadResources': {
@@ -3938,6 +5665,11 @@ ipcMain.handle('run-command', (event, request) => {
     return runCommandDispatcher(command, payload);
 });
 
+ipcMain.handle('get-character-status-monitor-snapshot', (event) => {
+    if (!isCharacterStatusMonitorSender(event)) return createCharacterStatusMonitorForbiddenSnapshot();
+    return readCharacterStatusMonitorSnapshot();
+});
+
 function applyGameProviderState(data) {
     ensureProviderPreferencesLoaded();
 
@@ -4048,6 +5780,10 @@ ipcMain.on('set-tray-status', (event, payload) => {
     if (typeof nextStatus === 'string' && nextStatus.trim()) {
         globalState.status = nextStatus;
         updateTrayDisplay();
+        // On DMM/Fanza the expedition monitor runs in the game iframe; setting
+        // document.title there doesn't propagate to the macOS window title (only
+        // the main frame's title does). Set it explicitly from the main process
+        // so both DMM/non-DMM paths display the status in the window title.
         if (hasMainWindow()) {
             try { mainWindow.setTitle('Crave Saga | ' + nextStatus); } catch (e) {}
         }
@@ -4092,7 +5828,7 @@ ipcMain.handle('set-font-override-settings', (event, settings) => {
         return saveFontOverrideSettings(settings);
     } catch (error) {
         const message = error?.message || String(error);
-        console.warn(`[FontOverride] 保存字体覆盖设置失败: ${message}`);
+        console.warn(`[FontOverride] Failed to save settings: ${message}`);
         return { error: message };
     }
 });
@@ -4100,11 +5836,11 @@ ipcMain.handle('set-font-override-settings', (event, settings) => {
 ipcMain.handle('select-font-override-file', async (event) => {
     const owner = BrowserWindow.fromWebContents(event.sender) || mainWindow || undefined;
     const result = await dialog.showOpenDialog(owner, {
-        title: '选择替换字体',
+        title: 'Select replacement font',
         properties: ['openFile'],
         filters: [
-            { name: '字体文件', extensions: ['ttf', 'otf', 'woff', 'woff2'] },
-            { name: '所有文件', extensions: ['*'] },
+            { name: 'Fonts', extensions: ['ttf', 'otf', 'woff', 'woff2'] },
+            { name: 'All Files', extensions: ['*'] },
         ],
     });
     if (result.canceled || !result.filePaths || !result.filePaths[0]) return null;

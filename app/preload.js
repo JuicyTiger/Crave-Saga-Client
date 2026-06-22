@@ -160,6 +160,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
         ipcRenderer.invoke('set-provider-language-preference', { provider, lang }).catch(() => false),
     getCustomScripts: () => ipcRenderer.invoke('get-custom-scripts').catch(() => []),
     hasAutomationBundle: () => ipcRenderer.invoke('has-automation-bundle').catch(() => false),
+    getCharacterStatusMonitorSnapshot: () =>
+        ipcRenderer.invoke('get-character-status-monitor-snapshot').catch(error => ({
+            schemaVersion: 1,
+            ok: false,
+            error: 'IPC_FAILURE',
+            source: null,
+            capturedAt: new Date().toISOString(),
+            characters: [],
+            message: error?.message || String(error)
+        })),
     updateTrayStatus: (data) => ipcRenderer.send('set-tray-status', data),
     getProxyPort: () => ipcRenderer.invoke('get-proxy-port'),
     getFontOverrideCss: () => ipcRenderer.invoke('get-font-override-css').catch(() => ''),
@@ -250,7 +260,8 @@ window.addEventListener('DOMContentLoaded', () => {
     const isSelectorPage = /\/selector\.html(?:[?#]|$)/i.test(currentUrl);
     const isExtensionPage = currentUrl.startsWith('chrome-extension://');
     // 內部 app 工具頁面（file://），不應套用遊戲注入邏輯。
-    const isAppInternalPage = currentUrl.startsWith('file://') && /\/notification-settings\.html(?:[?#]|$)/i.test(currentUrl);
+    const isAppInternalPage = currentUrl.startsWith('file://') &&
+        /\/(?:notification-settings|character-status-monitor)\.html(?:[?#]|$)/i.test(currentUrl);
     const hasProviderState =
         typeof providerState?.provider === 'string' &&
         providerState.provider.trim() &&
@@ -693,69 +704,69 @@ window.addEventListener('DOMContentLoaded', () => {
                         return null;
                     }
 
+                    function getNodeName(node) {
+                        return String(node && (node.name || node._name || '') || '');
+                    }
+
+                    function getNodeSortZ(node) {
+                        var z = Number(node && (node.zIndex != null ? node.zIndex : node._localZOrder));
+                        return isFinite(z) ? z : 0;
+                    }
+
+                    function getNodeSortOrder(node) {
+                        var order = Number(node && node._orderOfArrival);
+                        return isFinite(order) ? order : 0;
+                    }
+
+                    function getNodeChain(node) {
+                        var chain = [];
+                        var current = node;
+                        var guard = 0;
+                        while (current && guard < 64) {
+                            chain.unshift(current);
+                            current = current.parent || current._parent || null;
+                            guard += 1;
+                        }
+                        return chain;
+                    }
+
+                    function compareSceneOrder(a, b) {
+                        if (!a || !b || a === b) return 0;
+                        var aChain = getNodeChain(a);
+                        var bChain = getNodeChain(b);
+                        var length = Math.min(aChain.length, bChain.length);
+                        var index = 0;
+                        while (index < length && aChain[index] === bChain[index]) {
+                            index += 1;
+                        }
+                        var aNode = aChain[index] || a;
+                        var bNode = bChain[index] || b;
+                        var zDiff = getNodeSortZ(aNode) - getNodeSortZ(bNode);
+                        if (zDiff !== 0) return zDiff;
+                        return getNodeSortOrder(aNode) - getNodeSortOrder(bNode);
+                    }
+
+                    function isModalBlockerNode(node) {
+                        if (!node || !node._activeInHierarchy) return false;
+                        var name = getNodeName(node).toLowerCase();
+                        return name === 'modal' || name === 'modallayer';
+                    }
+
+                    function getBlockingModal(selectedCandidate, modalBlockers) {
+                        if (!selectedCandidate || !Array.isArray(modalBlockers)) return null;
+                        for (var i = 0; i < modalBlockers.length; i++) {
+                            var blocker = modalBlockers[i];
+                            if (compareSceneOrder(blocker, selectedCandidate.node) >= 0) {
+                                return blocker;
+                            }
+                        }
+                        return null;
+                    }
+
                     function autoLongPress(mousePosition) {
                         if (!window.cc || !cc.director || typeof cc.director.getScene !== 'function') return false;
                         var scene = cc.director.getScene();
                         if (!scene) return false;
-
-                        function getNodeName(node) {
-                            return String(node && (node.name || node._name || '') || '');
-                        }
-
-                        function getNodeSortZ(node) {
-                            var z = Number(node && (node.zIndex != null ? node.zIndex : node._localZOrder));
-                            return isFinite(z) ? z : 0;
-                        }
-
-                        function getNodeSortOrder(node) {
-                            var order = Number(node && node._orderOfArrival);
-                            return isFinite(order) ? order : 0;
-                        }
-
-                        function getNodeChain(node) {
-                            var chain = [];
-                            var current = node;
-                            var guard = 0;
-                            while (current && guard < 64) {
-                                chain.unshift(current);
-                                current = current.parent || current._parent || null;
-                                guard += 1;
-                            }
-                            return chain;
-                        }
-
-                        function compareSceneOrder(a, b) {
-                            if (!a || !b || a === b) return 0;
-                            var aChain = getNodeChain(a);
-                            var bChain = getNodeChain(b);
-                            var length = Math.min(aChain.length, bChain.length);
-                            var index = 0;
-                            while (index < length && aChain[index] === bChain[index]) {
-                                index += 1;
-                            }
-                            var aNode = aChain[index] || a;
-                            var bNode = bChain[index] || b;
-                            var zDiff = getNodeSortZ(aNode) - getNodeSortZ(bNode);
-                            if (zDiff !== 0) return zDiff;
-                            return getNodeSortOrder(aNode) - getNodeSortOrder(bNode);
-                        }
-
-                        function isModalBlockerNode(node) {
-                            if (!node || !node._activeInHierarchy) return false;
-                            var name = getNodeName(node).toLowerCase();
-                            return name === 'modal' || name === 'modallayer';
-                        }
-
-                        function getBlockingModal(selectedCandidate, modalBlockers) {
-                            if (!selectedCandidate || !Array.isArray(modalBlockers)) return null;
-                            for (var i = 0; i < modalBlockers.length; i++) {
-                                var blocker = modalBlockers[i];
-                                if (compareSceneOrder(blocker, selectedCandidate.node) >= 0) {
-                                    return blocker;
-                                }
-                            }
-                            return null;
-                        }
 
                         var candidates = [];
                         var modalBlockers = [];
@@ -1063,7 +1074,7 @@ window.addEventListener('DOMContentLoaded', () => {
                             }
                             if (!window.__cscFontOverrideCssInjected) {
                                 window.__cscFontOverrideCssInjected = true;
-                                console.log('[CSC] 已注入字体覆盖 CSS');
+                                console.log('[CSC] Injected font override CSS');
                             }
                         }).catch(function() {}).finally(function() {
                             window.__cscFontOverrideCssInstalling = false;
@@ -2548,6 +2559,7 @@ window.addEventListener('DOMContentLoaded', () => {
                         var _manifestFetchInflight = false;
                         var _massFetchStarted = false;
                         var _massFetchUrlBase = null;
+                        var _userMainFallbackFetchStarted = false;
                         function detectBinUrlBase() {
                             if (_massFetchUrlBase) return _massFetchUrlBase;
                             // Match any gg-resource URL (e.g., resource.txt) to derive
@@ -2589,10 +2601,20 @@ window.addEventListener('DOMContentLoaded', () => {
                         }
                         function maybeKickoffMassFetch() {
                             if (_massFetchStarted) return;
-                            if (!_masterDataManifest || !window.__cscPb) return;
+                            if (!_masterDataManifest || !window.__cscPb) {
+                                maybeFetchUserMainFallback();
+                                return;
+                            }
                             _massFetchStarted = true;
                             clearInterval(_binFetchInterval);
                             massFetchAllTables();
+                        }
+                        async function maybeFetchUserMainFallback() {
+                            if (_userMainFallbackFetchStarted) return;
+                            if (!_masterDataManifest || !_masterDataManifest.UserMain) return;
+                            if (masterData && masterData.user && masterData.user.UserMain) return;
+                            _userMainFallbackFetchStarted = true;
+                            await fetchAndDecodeBin('UserMain', _masterDataManifest.UserMain);
                         }
                         async function massFetchAllTables() {
                             try {
@@ -2767,8 +2789,54 @@ window.addEventListener('DOMContentLoaded', () => {
                             raidState.currentScore = 0;
                         }
 
+                        function updateCharacterStatusMonitorRuntime(pathname, data) {
+                            try {
+                                if (!pathname || !data) return;
+                                var state = window.__cscCharacterStatusMonitor || {};
+                                if (/\\/deck\\/(setEquipment|setEquipments|setUnits)$/.test(pathname)) {
+                                    var updateDecks = Array.isArray(data.updateDecks) ? data.updateDecks : [];
+                                    var deck = updateDecks.length > 0 && updateDecks[0] && typeof updateDecks[0] === 'object'
+                                        ? updateDecks[0]
+                                        : null;
+                                    state.lastDeckEquipmentUpdate = {
+                                        capturedAt: new Date().toISOString(),
+                                        pathname: pathname,
+                                        deckId: deck && deck.deckId != null ? deck.deckId : null,
+                                        updateDeckCount: updateDecks.length
+                                    };
+                                    window.__cscCharacterStatusMonitor = state;
+                                    return;
+                                }
+                                if (!/\\/character\\/enabledTree$/.test(pathname)) return;
+                                var updateCharacters = data.updateCharacters;
+                                var character = Array.isArray(updateCharacters) ? updateCharacters[0] : null;
+                                if (!character || typeof character !== 'object') return;
+                                var trees = Array.isArray(character.trees) ? character.trees : [];
+                                var enabledTreeCount = 0;
+                                var disabledTreeCount = 0;
+                                for (var i = 0; i < trees.length; i += 1) {
+                                    if (!trees[i]) continue;
+                                    if (trees[i].isEnabled === true) enabledTreeCount += 1;
+                                    if (trees[i].isEnabled === false) disabledTreeCount += 1;
+                                }
+                                state.lastEnabledTree = {
+                                    capturedAt: new Date().toISOString(),
+                                    pathname: pathname,
+                                    characterCd: character.characterCd || null,
+                                    characterId: character.characterId == null ? null : character.characterId,
+                                    level: character.level == null ? null : character.level,
+                                    treeCount: trees.length,
+                                    enabledTreeCount: enabledTreeCount,
+                                    disabledTreeCount: disabledTreeCount,
+                                    updateCharacter: character
+                                };
+                                window.__cscCharacterStatusMonitor = state;
+                            } catch (e) {}
+                        }
+
                         function processApiResponse(pathname, data) {
                             if (!pathname || !data) return;
+                            updateCharacterStatusMonitorRuntime(pathname, data);
                             if (/\\/getMasterData\\d*$/.test(pathname)) {
                                 processMasterData(pathname, data);
                             } else if (/\\/user\\/getSystemDate$/.test(pathname)) {
@@ -3643,12 +3711,6 @@ window.addEventListener('DOMContentLoaded', () => {
                     if (statusString === lastPublishedStatus) return;
                     lastPublishedStatus = statusString;
 
-                    try {
-                        if (document && typeof document.title === 'string') {
-                            document.title = 'Crave Saga | ' + statusString;
-                        }
-                    } catch (e) {}
-
                     window.electronAPI.updateTrayStatus({ status: statusString });
                 }
 
@@ -4323,8 +4385,54 @@ window.addEventListener('DOMContentLoaded', () => {
                     window.__cscMainEventBridgeInstalled = true;
                 }
 
+                function updateCharacterStatusMonitorRuntime(pathname, data) {
+                    try {
+                        if (!pathname || !data) return;
+                        var state = window.__cscCharacterStatusMonitor || {};
+                        if (/\\/deck\\/(setEquipment|setEquipments|setUnits)$/.test(pathname)) {
+                            var updateDecks = Array.isArray(data.updateDecks) ? data.updateDecks : [];
+                            var deck = updateDecks.length > 0 && updateDecks[0] && typeof updateDecks[0] === 'object'
+                                ? updateDecks[0]
+                                : null;
+                            state.lastDeckEquipmentUpdate = {
+                                capturedAt: new Date().toISOString(),
+                                pathname: pathname,
+                                deckId: deck && deck.deckId != null ? deck.deckId : null,
+                                updateDeckCount: updateDecks.length
+                            };
+                            window.__cscCharacterStatusMonitor = state;
+                            return;
+                        }
+                        if (!/\\/character\\/enabledTree$/.test(pathname)) return;
+                        var updateCharacters = data.updateCharacters;
+                        var character = Array.isArray(updateCharacters) ? updateCharacters[0] : null;
+                        if (!character || typeof character !== 'object') return;
+                        var trees = Array.isArray(character.trees) ? character.trees : [];
+                        var enabledTreeCount = 0;
+                        var disabledTreeCount = 0;
+                        for (var i = 0; i < trees.length; i += 1) {
+                            if (!trees[i]) continue;
+                            if (trees[i].isEnabled === true) enabledTreeCount += 1;
+                            if (trees[i].isEnabled === false) disabledTreeCount += 1;
+                        }
+                        state.lastEnabledTree = {
+                            capturedAt: new Date().toISOString(),
+                            pathname: pathname,
+                            characterCd: character.characterCd || null,
+                            characterId: character.characterId == null ? null : character.characterId,
+                            level: character.level == null ? null : character.level,
+                            treeCount: trees.length,
+                            enabledTreeCount: enabledTreeCount,
+                            disabledTreeCount: disabledTreeCount,
+                            updateCharacter: character
+                        };
+                        window.__cscCharacterStatusMonitor = state;
+                    } catch (e) {}
+                }
+
                 function processApiResponse(pathname, data) {
                     if (!pathname || !data) return;
+                    updateCharacterStatusMonitorRuntime(pathname, data);
 
                     if (/\\/getMasterData\\d*$/.test(pathname)) {
                         processMasterData(pathname, data);
@@ -4742,7 +4850,7 @@ window.addEventListener('DOMContentLoaded', () => {
                         }
                         if (!window.__cscFontOverrideCssInjected) {
                             window.__cscFontOverrideCssInjected = true;
-                            console.log('[CSC] 已注入字体覆盖 CSS');
+                            console.log('[CSC] Injected font override CSS');
                         }
                     }).catch(() => {}).finally(() => {
                         window.__cscFontOverrideCssInstalling = false;
@@ -4750,7 +4858,12 @@ window.addEventListener('DOMContentLoaded', () => {
                 }
 
                 function prepareCacheLoader() {
-                    if (typeof __require !== 'function' || typeof window.cc !== 'object') {
+                    if (
+                        typeof __require !== 'function' ||
+                        typeof window.cc !== 'object' ||
+                        !window.cc.assetManager ||
+                        !window.cc.assetManager.packManager
+                    ) {
                         requestAnimationFrame(prepareCacheLoader);
                         return;
                     }
